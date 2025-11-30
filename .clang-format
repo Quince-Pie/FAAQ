@@ -1,87 +1,240 @@
-BasedOnStyle: GNU
-UseTab:          Never
-IndentWidth:     4
+---
+# 'Language Standards': Target C++
+Language: Cpp
+
+Standard: Latest
+
+# 'Base Style': No base style assumption; fully specified.
+# However, defining BasedOnStyle: LLVM gives a sane fallback for obscure keys not explicitly overridden.
+BasedOnStyle: LLVM
+
+# ------------------------------------------------------------------------------
+# INDENTATION & SPACING (Phase 1.1)
+# ------------------------------------------------------------------------------
+
+# 'Indentation': Indent width must be 4 spaces.
+IndentWidth: 4
+
+# 'Indentation': Tabs are strictly prohibited.
+UseTab: Never
+
+# 'Indentation': Tab width defined for safety.
+TabWidth: 4
+
+# 'Indentation': Continuation lines match block indent.
 ContinuationIndentWidth: 4
 
-BreakBeforeBraces: Attach
-
-BreakAfterReturnType: AllDefinitions
-
-ColumnLimit:      120
-BreakBeforeBinaryOperators: All
-BreakBeforeTernaryOperators: true
-BreakStringLiterals: true
-BinPackArguments: false
-BinPackParameters: false
-AlignAfterOpenBracket: BlockIndent
-
-SpaceBeforeParens: ControlStatements
-SpaceAfterCStyleCast: true
-SpaceBeforeAssignmentOperators: true
-SpacesInParens: Never
-SpacesInSquareBrackets: false
-SpacesInLineCommentPrefix:
-  Minimum: 1
-  Maximum: 1
-
-PointerAlignment: Right
-
-AlignConsecutiveAssignments:
-  Enabled:          true
-  AcrossEmptyLines: true
-  AcrossComments:   true
-  PadOperators:     true
-AlignConsecutiveBitFields:
-  Enabled:          true
-  AcrossEmptyLines: true
-  AcrossComments:   true
-AlignConsecutiveDeclarations:
-  Enabled:          true
-  AcrossEmptyLines: true
-  AcrossComments:   true
-  AlignFunctionDeclarations: true
-AlignConsecutiveMacros:
-  Enabled:          true
-  AcrossEmptyLines: true
-  AcrossComments:   true
-AlignOperands:    Align
-AlignTrailingComments:
-  Kind:           Always
-  OverEmptyLines: 1
-AlignArrayOfStructures: Left
-
-InsertBraces: true
-AllowShortBlocksOnASingleLine: Never
-AllowShortFunctionsOnASingleLine: None
-AllowShortIfStatementsOnASingleLine: Never
-AllowShortLoopsOnASingleLine: false
-AllowShortEnumsOnASingleLine: false
-AllowShortCaseLabelsOnASingleLine: false
-
+# 'Switch Statements': Case labels must be indented relative to switch.
 IndentCaseLabels: true
-IndentCaseBlocks: true
 
-IndentPPDirectives: None
-SortIncludes:    CaseSensitive
-IncludeBlocks:   Regroup
+# 'Switch Statements': Case blocks are not deeply indented, just the label.
+IndentCaseBlocks: false
+
+# 'Access Modifiers': Public/Private keywords aligned with class definition.
+AccessModifierOffset: -4
+
+# 'Namespaces': Do not indent code inside namespaces.
+NamespaceIndentation: None
+
+# 'Preprocessor': Indent preprocessor directives after the hash.
+IndentPPDirectives: AfterHash
+
+# ------------------------------------------------------------------------------
+# BRACE WRAPPING (Phase 1.2)
+# ------------------------------------------------------------------------------
+
+# 'Brace Style': Custom hybrid style (Allman for fns/classes, K&R for control).
+BreakBeforeBraces: Custom
+
+# Detailed Brace Rules
+BraceWrapping:
+  #  Class braces on new line.
+  AfterClass: true
+
+  #  Control statements (if/for/while) attached to line.
+  AfterControlStatement: Never
+
+  #  Enum braces on new line.
+  AfterEnum: true
+
+  #  Function braces on new line.
+  AfterFunction: true
+
+  #  Namespace braces on new line.
+  AfterNamespace: true
+
+  #  Struct braces on new line.
+  AfterStruct: true
+
+  #  Union braces on new line.
+  AfterUnion: true
+
+  #  Extern braces on new line.
+  AfterExternBlock: true
+
+  #  Catch blocks attached (Stroustrup/K&R style implied by control statement logic).
+  BeforeCatch: false
+
+  #  Else blocks attached.
+  BeforeElse: false
+
+  #  Split empty function bodies to enforce brace visibility.
+  SplitEmptyFunction: true
+
+  #  Split empty record bodies.
+  SplitEmptyRecord: true
+
+  #  Split empty namespaces.
+  SplitEmptyNamespace: true
+
+# ------------------------------------------------------------------------------
+# LINE BREAKING & WRAPPING (Phase 1.4, 1.7, 1.10)
+# ------------------------------------------------------------------------------
+
+# 'Line Length': strict 100 character limit.
+ColumnLimit: 100
+
+# 'Line Length': High penalty to prevent exceeding limit.
+PenaltyExcessCharacter: 1000000
+
+# 'Binary Operators': Break before operators (math-style).
+BreakBeforeBinaryOperators: All
+
+# 'Function Arguments': Do not bin-pack. One per line or all on one line.
+BinPackArguments: false
+
+# 'Function Parameters': Do not bin-pack declarations.
+BinPackParameters: false
+
+# 'Arguments': Align arguments after open bracket if they span lines.
+# PDF snippet  page 3 says "As of clang-format 22... Align replaced with true".
+AlignAfterOpenBracket: Align
+
+# 'Ternary Operators': Place operators after line breaks?
+# Usually strict styles prefer `?` and `:` at start of line.
+BreakBeforeTernaryOperators: true
+
+# 'Strings': Always break multiline strings.
+AlwaysBreakBeforeMultilineStrings: true
+
+# 'Strings': Break string literals if they exceed column limit.
+BreakStringLiterals: true
+
+# ------------------------------------------------------------------------------
+# ALIGNMENT & POINTERS (Phase 1.3, 1.13)
+# ------------------------------------------------------------------------------
+
+# 'Pointers': Pointer binds to type (Left alignment).
+PointerAlignment: Left
+
+# 'Pointers': Enforce strictly, do not derive from existing code.
+DerivePointerAlignment: false
+
+# 'Assignments': Align consecutive assignments for readability.
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# 'Declarations': Align consecutive declarations.
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# 'Bitfields': Align consecutive bitfields.
+AlignConsecutiveBitFields:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# 'Bitfields': Space around colons.
+BitFieldColonSpacing: Both
+
+# ------------------------------------------------------------------------------
+# INCLUDES (Phase 1.5)
+# ------------------------------------------------------------------------------
+
+# 'Includes': Sort includes alphabetically.
+SortIncludes: CaseSensitive
+
+# 'Includes': Group system vs project headers.
+IncludeBlocks: Regroup
+
+# 'Includes': Define categories.
 IncludeCategories:
-  - Regex:           '<main_header_match>'
-    Priority:        -1
-  - Regex:           '^<.*\.h>'
+  # System headers (angle brackets) go first
+  - Regex:           '^<.*'
     Priority:        1
-  - Regex:           '^<.*>'
+  # Third-party headers (custom regex needed, using generic "libs" placeholder)
+  - Regex:           '^".*/libs/.*'
     Priority:        2
-  - Regex:           '".*"'
+  # Project headers (catch-all)
+  - Regex:           '.*'
     Priority:        3
 
-IndentGotoLabels: false
+# ------------------------------------------------------------------------------
+# ADVANCED & MISC OPTIONS
+# ------------------------------------------------------------------------------
 
-
+# 'Attributes': Break after C++11 attributes.
 BreakAfterAttributes: Always
 
-QualifierAlignment: Custom
-QualifierOrder: [ static, type, const, volatile, restrict ]
+# 'Empty Lines': Keep max 1 empty line to prevent sprawling vertical space.
+MaxEmptyLinesToKeep: 1
 
-KeepFormFeed: true
-InsertNewlineAtEOF: true
+# 'Constructors': Pack initializers if possible, or break strictly.
+# "Strict" usually implies one per line if they wrap.
+PackConstructorInitializers: NextLine
+
+# 'Templates': Break template declarations for readability.
+BreakTemplateDeclarations: Yes
+
+# 'Spaces': No space after function name in call.
+SpaceAfterCStyleCast: false
+
+# 'Spaces': Space after logical not `!` usually false in C++.
+SpaceAfterLogicalNot: false
+
+# 'Spaces': Ensure space before parens in control statements.
+SpaceBeforeParens: ControlStatements
+
+# 'References': Reference alignment matches pointer alignment.
+ReferenceAlignment: Pointer
+
+# 'Short Functions': Do not allow short functions on a single line.
+AllowShortFunctionsOnASingleLine: None
+
+# 'Short Ifs': Do not allow short if statements on a single line.
+AllowShortIfStatementsOnASingleLine: Never
+
+# 'Short Loops': Do not allow short loops on a single line.
+AllowShortLoopsOnASingleLine: false
+
+# 'Short Blocks': Prevent "one-liners" for clarity.
+AllowShortBlocksOnASingleLine: Never
+
+# 'Lambdas': Indent lambda body to outer scope for cleanliness.
+LambdaBodyIndentation: OuterScope
+
+# 'Concepts': Indent requires clauses.
+IndentRequiresClause: true
+
+# 'Casts': Do not insert spaces in C-style casts.
+SpacesInParens: Custom
+SpacesInParensOptions:
+  InCStyleCasts: false
+  InConditionalStatements: false
+  InEmptyParentheses: false
+  Other: false
+
+# 'Trailing Comments': Align trailing comments.
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 1
+
+# 'Break Inheritance': Break inheritance lists (BeforeColon or BeforeComma).
+# Strict usually prefers stacking.
+BreakInheritanceList: BeforeColon
+
 ...

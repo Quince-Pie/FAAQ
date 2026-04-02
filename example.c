@@ -54,7 +54,7 @@ run_simple_example() {
     // Destroy the queue to free all memory.
     // This should only be done when you are sure no other threads are
     // accessing the queue (e.g., after all threads are joined).
-    faa_queue_destroy(q);
+    faa_queue_destroy(q, nullptr);
     printf("Queue destroyed successfully.\n\n");
 }
 
@@ -134,7 +134,7 @@ run_multithread_example() {
     printf("Verification successful.\n");
 
     // Destroy the queue.
-    faa_queue_destroy(g_queue);
+    faa_queue_destroy(g_queue, nullptr);
     printf("Queue destroyed successfully.\n");
 }
 

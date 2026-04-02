@@ -30,6 +30,7 @@
 #define HP_NUM_SHARDS 8          // Number of retired list shards.
 #define HP_RCOUNT_THRESHOLD 1000 // Base threshold for reclamation (R).
 #define HP_HCOUNT_MULTIPLIER 2   // Dynamic threshold multiplier (K). Threshold = max(R, H*K).
+#define HP_TLC_BATCH_SIZE 16     // Retirement count batch size for TLS batching.
 
 // Constraint: HP_NUM_SHARDS must be a power of 2 for efficient indexing via masking.
 static_assert((HP_NUM_SHARDS > 0) && ((HP_NUM_SHARDS & (HP_NUM_SHARDS - 1)) == 0),
@@ -92,11 +93,10 @@ void hazptr_cleanup(void);
 struct hazptr_rec
 {
     alignas(HP_CACHE_LINE_SIZE) _Atomic(void const*) ptr;
+    _Atomic(bool) active; // True when the record is in use. Solves ABA.
 
     /* Metadata (COLD fields) */
     hazptr_rec_t* next; // Link for the global list of all records (hprec_list).
-    hazptr_rec_t*
-        next_avail;     // Link for the available records stack (hprec_avail) or TLC flush list.
     hazptr_domain_t* domain;
 };
 
@@ -163,8 +163,10 @@ static inline void hazptr_reset(hazptr_holder_t* h, void const* ptr)
  *
  * Retiree (hazptr_retire):
  *   (Prior: Remove object from data structure)
- *   F3: Fence (SeqCst).
  *   S2: Push onto retired list (Release).
+ *   NOTE: F3 (SeqCst fence) is deliberately omitted. The release store in S2
+ *   synchronizes-with the acquire exchange in X1, forming a happens-before edge
+ *   that makes F3 mathematically redundant (saving a costly barrier on hot path).
  *
  * Reclaimer (domain_do_reclamation):
  *   X1: Extract retired lists (Acquire).
@@ -180,7 +182,7 @@ static inline void hazptr_reset(hazptr_holder_t* h, void const* ptr)
  * Case 2: F2 happens-before F1.
  *   X1 -> F2 -> F1 -> L2. The extraction (X1) happens before the validation (L2).
  *   If validation (L2) succeeds, the object must have been present in the data
- *   structure at the time of L2. Therefore, its retirement (F3/S2) must have occurred
+ *   structure at the time of L2. Therefore, its retirement (S2) must have occurred
  *   after X1. The object is not in the batch being reclaimed. The object is safe.
  *
  * This guarantees that an object is reclaimed if and only if no hazard pointer
@@ -214,7 +216,7 @@ static inline void hazptr_reset(hazptr_holder_t* h, void const* ptr)
             /* 2. Synchronization Fence (F1). */                                                   \
             /* This SeqCst fence ensures that the HP write (S1) is globally visible */             \
             /* before the validation load (L2) executes. It prevents Store-Load reordering */      \
-            /* and synchronizes with F2/F3. */                                                     \
+            /* and synchronizes with F2. */                                                         \
             atomic_thread_fence(memory_order_seq_cst);                                             \
                                                                                                    \
             /* 3. Validate by reloading the source (L2). */                                        \

@@ -11,6 +11,11 @@ constexpr static size_t FAA_BUFFER_SIZE = 1024;
 
 constexpr static size_t FAA_ALIGNMENT = 128;
 
+// Stride for mapping logical indices to physically distant array slots.
+// Must be coprime to FAA_BUFFER_SIZE. 17 * 8 = 136 bytes between consecutive
+// indices, eliminating cache-line bouncing on adjacent FAA slots.
+constexpr static size_t FAA_STRIDE = 17;
+
 typedef struct FAA_Node Node_t;
 
 struct FAA_Node
@@ -63,7 +68,7 @@ FAAArrayQueue_t* faa_queue_create(int max_threads);
  *
  * @param q Pointer to the queue structure.
  */
-void faa_queue_destroy(FAAArrayQueue_t* q);
+void faa_queue_destroy(FAAArrayQueue_t* q, void (*free_payload)(void*));
 
 /**
  * @brief Enqueues an item into the queue.

@@ -5,14 +5,16 @@
 #include <threads.h> // C23 Thread Support Library
 
 /*
- * External dependency: khashl.h
- * A high-performance, embeddable hash table library used for efficient
- * storage and querying of protected pointers during reclamation.
+ * Comparison function for qsort/bsearch on pointer arrays.
+ * Used during reclamation to efficiently match retired objects against
+ * the set of currently protected pointers.
  */
-#include "khashl.h"
-
-// Initialize a khashl set specialized for storing uintptr_t keys (pointers).
-KHASHL_SET_INIT(KH_LOCAL, ptr_set_t, ptr_set, uintptr_t, kh_hash_uint64, kh_eq_generic)
+static int ptr_compare(const void* a, const void* b)
+{
+    uintptr_t pa = (uintptr_t)*(void const* const*)a;
+    uintptr_t pb = (uintptr_t)*(void const* const*)b;
+    return (pa > pb) - (pa < pb);
+}
 
 // ----------------------------------------------------------------------------
 // Domain Structure Definitions
@@ -43,10 +45,8 @@ typedef struct
  *  | hazptr_domain_t                                                         |
  *  |-------------------------------------------------------------------------|
  *  | Group 1: Cold/Moderate Data (HP Record Management)                      |
- *  | hprec_list (Scan source)                                                |
- *  | hprec_avail (Available stack - TLC miss/flush)                          |
+ *  | hprec_list (Scan source, acquire via active flag)                        |
  *  | hprec_count (Threshold calculation)                                     |
- *  | scan_set (Used only during reclamation)                                 |
  *  +-------------------------------------------------------------------------+
  *  | Cache Line Boundary (alignas)                                           |
  *  +-------------------------------------------------------------------------+
@@ -70,9 +70,7 @@ struct hazptr_domain
 {
     // --- Group 1: HP Record Management ---
     _Atomic(hazptr_rec_t*) hprec_list;  // Global list of all allocated HP records.
-    _Atomic(hazptr_rec_t*) hprec_avail; // Lock-free stack of available HP records.
     _Atomic(size_t)        hprec_count; // Total count of allocated HP records (H).
-    ptr_set_t*             scan_set;    // Hash set used during reclamation scan.
 
     // --- Group 2: Reclamation Control (High Contention) ---
 
@@ -105,16 +103,22 @@ typedef struct
 {
     hazptr_rec_t* records[HP_TLC_CAPACITY];
     size_t        count;
+    size_t        retired_batch; // Batched retirement count to reduce contention.
 } hazptr_tc_t;
 
-// Initialize count to 0 using C23 empty braces {}.
-static thread_local hazptr_tc_t tls_cache = {};
+/*
+ * Pointer to the heap-allocated TLC for this thread. Using calloc + TSS destructor
+ * decouples TLC lifetime from thread_local destruction order, which the C standard
+ * leaves undefined relative to TSS destructors. The thread_local pointer provides
+ * zero-latency access on the hot path; the TSS owns the actual memory for teardown.
+ */
+static thread_local hazptr_tc_t* local_tc_ptr = nullptr;
 
 /*
  * Thread Specific Storage (TSS) key for automatic TLC cleanup.
  * Rationale: We must return cached HP records (global resources) back to the
  * domain upon thread exit. The C23 TSS API provides the necessary destructor
- * capability. We store the address of the thread's 'tls_cache' in the TSS.
+ * capability. We store the address of the heap-allocated TLC in the TSS.
  */
 static tss_t     hazptr_tss_key;
 static once_flag tss_init_flag = ONCE_FLAG_INIT;
@@ -124,8 +128,6 @@ static once_flag tss_init_flag = ONCE_FLAG_INIT;
 // ----------------------------------------------------------------------------
 
 static hazptr_rec_t* domain_acquire_hprec(hazptr_domain_t* domain);
-static void
-domain_release_hprec_list(hazptr_domain_t* domain, hazptr_rec_t* head, hazptr_rec_t* tail);
 static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claimed_count);
 
 // ----------------------------------------------------------------------------
@@ -133,38 +135,22 @@ static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claime
 // ----------------------------------------------------------------------------
 
 /*
- * Flushes the thread local cache back to the domain's available stack.
+ * Flushes the thread local cache by marking cached records as inactive.
+ * Wait-free: no atomic RMW, just release stores.
  */
 static void tlc_flush(hazptr_tc_t* tc)
 {
-    if (tc->count == 0) {
-        return;
+    for (size_t i = 0; i < tc->count; ++i) {
+        atomic_store_explicit(&tc->records[i]->active, false, memory_order_release);
     }
-
-    // We only support TLC for the default domain in this implementation.
-    hazptr_domain_t* domain = &default_domain;
-
-    /*
-     * Optimization: Batch the release. We locally link the cached records
-     * into a list and attach them to the domain's 'hprec_avail' stack
-     * with a single atomic operation.
-     */
-
-    // Build the linked list locally.
-    hazptr_rec_t* head = tc->records[0];
-    hazptr_rec_t* tail = head;
-    head->next_avail   = nullptr;
-
-    for (size_t i = 1; i < tc->count; ++i) {
-        hazptr_rec_t* rec = tc->records[i];
-        rec->next_avail   = nullptr;
-        tail->next_avail  = rec;
-        tail              = rec;
-    }
-
-    // Release the entire list to the domain.
-    domain_release_hprec_list(domain, head, tail);
     tc->count = 0;
+
+    // Flush any batched retirement count to the global counter.
+    if (tc->retired_batch > 0) {
+        atomic_fetch_add_explicit(
+            &default_domain.retired_count, (hazptr_count_t)tc->retired_batch, memory_order_acq_rel);
+        tc->retired_batch = 0;
+    }
 }
 
 /*
@@ -173,8 +159,8 @@ static void tlc_flush(hazptr_tc_t* tc)
 static void hazptr_tss_destructor(void* data)
 {
     if (data) {
-        // Data holds the address of the thread's tls_cache instance.
         tlc_flush((hazptr_tc_t*)data);
+        free(data); // Safe: heap-allocated, decoupled from TLS destruction order.
     }
 }
 
@@ -195,23 +181,21 @@ static void initialize_tss(void)
  */
 static inline void ensure_thread_registered(void)
 {
-    // Initialize the global key if necessary (thread-safe).
-    call_once(&tss_init_flag, initialize_tss);
+    if (!local_tc_ptr) {
+        call_once(&tss_init_flag, initialize_tss);
 
-    // Check if this thread has already registered its TLC address.
-    // Using a thread_local bool is faster than repeatedly calling tss_get().
-    static thread_local bool registered = false;
-    if (!registered) {
-        /*
-         * Register the address of this thread's 'tls_cache' with the global TSS key.
-         */
-        if (tss_set(hazptr_tss_key, &tls_cache) != thrd_success) {
-            // Failure to set the TSS value means automatic cleanup won't happen.
+        // Heap-allocate the TLC, decoupled from undefined TLS destruction order.
+        local_tc_ptr = calloc(1, sizeof(hazptr_tc_t));
+        if (!local_tc_ptr) {
+            fprintf(stderr, "C23 Hazptr Fatal Error: OOM for TLC allocation.\n");
+            abort();
+        }
+
+        if (tss_set(hazptr_tss_key, local_tc_ptr) != thrd_success) {
             fprintf(stderr,
                     "C23 Hazptr Warning: Failed to set TSS value. Automatic cleanup disabled for "
                     "this thread.\n");
         }
-        registered = true;
     }
 }
 
@@ -220,9 +204,8 @@ static inline void ensure_thread_registered(void)
  */
 static inline hazptr_rec_t* tlc_try_acquire(void)
 {
-    if (tls_cache.count > 0) {
-        // Cache hit. Involves only thread-local operations.
-        return tls_cache.records[--tls_cache.count];
+    if (local_tc_ptr && local_tc_ptr->count > 0) {
+        return local_tc_ptr->records[--local_tc_ptr->count];
     }
     return nullptr;
 }
@@ -232,9 +215,8 @@ static inline hazptr_rec_t* tlc_try_acquire(void)
  */
 static inline bool tlc_try_release(hazptr_rec_t* rec)
 {
-    if (tls_cache.count < HP_TLC_CAPACITY) {
-        // Cache has space. Involves only thread-local operations.
-        tls_cache.records[tls_cache.count++] = rec;
+    if (local_tc_ptr && local_tc_ptr->count < HP_TLC_CAPACITY) {
+        local_tc_ptr->records[local_tc_ptr->count++] = rec;
         return true;
     }
     return false;
@@ -246,81 +228,50 @@ static inline bool tlc_try_release(hazptr_rec_t* rec)
 
 /*
  * Acquires an HP record from the domain. Used when the TLC is empty.
+ * Scans the append-only global list for an inactive record (active == false),
+ * claiming it via CAS. Allocates a new record only if none are available.
  */
 static hazptr_rec_t* domain_acquire_hprec(hazptr_domain_t* domain)
 {
-    // 1. Try popping from the domain's lock-free available stack (hprec_avail).
-    hazptr_rec_t* rec = atomic_load_explicit(&domain->hprec_avail, memory_order_acquire);
+    // 1. Scan the global list for an inactive record.
+    hazptr_rec_t* rec = atomic_load_explicit(&domain->hprec_list, memory_order_acquire);
     while (rec) {
-        hazptr_rec_t* next = rec->next_avail; // next_avail is stable while on the stack.
-        if (atomic_compare_exchange_weak_explicit(
-                &domain->hprec_avail,
-                &rec,
-                next,
-                memory_order_release, // Success: Synchronizes with the push (release).
-                memory_order_acquire  // Failure: Reload rec with acquire semantics.
-                )) {
-            rec->next_avail = nullptr;
+        bool expected = false;
+        if (!atomic_load_explicit(&rec->active, memory_order_relaxed)
+            && atomic_compare_exchange_strong_explicit(
+                &rec->active, &expected, true, memory_order_acquire, memory_order_relaxed)) {
             return rec;
         }
-        // CAS failed, rec is updated by CAS, retry.
+        rec = rec->next;
     }
 
-    // 2. Stack empty, allocate a new record.
-    // Use C23 aligned_alloc to ensure cache line alignment defined in hp.h.
+    // 2. No inactive record found, allocate a new one.
     rec = aligned_alloc(HP_CACHE_LINE_SIZE, sizeof(hazptr_rec_t));
     if (!rec) {
-        // Allocation failure is treated as fatal.
-        // Failure to acquire protection guarantees future corruption.
         fprintf(stderr, "C23 Hazptr Fatal Error: OOM when allocating hazptr_rec_t.\n");
         abort();
     }
 
     // 3. Initialize the record.
     atomic_init(&rec->ptr, nullptr);
-    rec->domain     = domain;
-    rec->next_avail = nullptr;
+    atomic_init(&rec->active, true);
+    rec->domain = domain;
 
-    // 4. Add to the global hprec_list (required for scanning).
+    // 4. Update the count FIRST. This guarantees that max_hps (loaded by a
+    // concurrent reclaimer) is always >= the actual list length, preventing
+    // scan truncation.
+    atomic_fetch_add_explicit(&domain->hprec_count, 1, memory_order_acq_rel);
+
+    // 5. Add to the global hprec_list (append-only, required for scanning).
     hazptr_rec_t* head = atomic_load_explicit(&domain->hprec_list, memory_order_relaxed);
     do {
         rec->next = head;
-        /* memory_order_release ensures the initialization of the record is
-         * visible before it is added to the list. Synchronizes with
-         * memory_order_acquire load (L3) in the reclamation scan. */
     } while (!atomic_compare_exchange_weak_explicit(&domain->hprec_list,
                                                     &head,
                                                     rec,
-                                                    memory_order_release, // Success
-                                                    memory_order_relaxed  // Failure
-                                                    ));
-
-    // 5. Update the count. Used for dynamic threshold calculation.
-    // Acq_rel ensures synchronization with threshold calculation loads.
-    atomic_fetch_add_explicit(&domain->hprec_count, 1, memory_order_acq_rel);
+                                                    memory_order_release,
+                                                    memory_order_relaxed));
     return rec;
-}
-
-/*
- * Releases a list of records (linked via next_avail) back to the domain.
- */
-static void
-domain_release_hprec_list(hazptr_domain_t* domain, hazptr_rec_t* head, hazptr_rec_t* tail)
-{
-    assert(tail != nullptr && tail->next_avail == nullptr);
-
-    // Push the entire list onto the lock-free available stack (hprec_avail).
-    hazptr_rec_t* old_head = atomic_load_explicit(&domain->hprec_avail, memory_order_relaxed);
-    do {
-        tail->next_avail = old_head;
-        /* memory_order_release ensures the list linkage is visible before
-         * the stack head is updated. Synchronizes with the pop in domain_acquire_hprec. */
-    } while (!atomic_compare_exchange_weak_explicit(&domain->hprec_avail,
-                                                    &old_head,
-                                                    head,
-                                                    memory_order_release, // Success
-                                                    memory_order_relaxed  // Failure
-                                                    ));
 }
 
 // ----------------------------------------------------------------------------
@@ -333,11 +284,13 @@ domain_release_hprec_list(hazptr_domain_t* domain, hazptr_rec_t* head, hazptr_re
 static inline size_t calc_shard(void const* ptr)
 {
     /*
-     * Simple hash based on address bits. We shift right to ignore low-order
-     * alignment bits (e.g., 4 bits ignores the lowest 16 bytes), which often
-     * lack entropy. The mask ensures the result is within bounds.
+     * Fibonacci multiplicative hash. Shift right past 128-byte alignment zeros,
+     * then multiply by the golden ratio fraction of 2^64 to scatter entropy.
+     * A simple mask like (x >> 7) & 7 produces degenerate patterns for
+     * sequentially allocated aligned objects (e.g., only shards 0 and 4).
      */
-    return ((uintptr_t)ptr >> 4) & (HP_NUM_SHARDS - 1);
+    uintptr_t x = (uintptr_t)ptr >> 7;
+    return (size_t)((x * 11400714819323198485ULL) >> 61);
 }
 
 /*
@@ -393,11 +346,10 @@ static hazptr_count_t domain_check_threshold(hazptr_domain_t* domain)
  *
  * Strategy Overview:
  * 1. Serialization: Ensure only one thread performs reclamation at a time.
- * 2. Initialization: Lazily initialize the scan set. Handle OOM gracefully.
- * 3. Iterative Processing (The Reclamation Loop):
+ * 2. Iterative Processing (The Reclamation Loop):
  *    a. Extraction: Atomically extract all retired objects from all shards (X1).
  *    b. Synchronization Fence (F2): Ensure visibility of all hazard pointers.
- *    c. Scan: Load all currently protected pointers into the hash set (L3/L4).
+ *    c. Scan: Load all currently protected pointers into a sorted array (L3/L4).
  *    d. Match and Reclaim: Reclaim safe objects, preserve protected ones.
  *    e. Restoration: Return protected objects back to the domain (Shard 0 optimization).
  *    f. Accounting: Adjust the global 'retired_count' based on the net change.
@@ -406,199 +358,208 @@ static hazptr_count_t domain_check_threshold(hazptr_domain_t* domain)
  */
 static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claimed_count)
 {
-    // 1. Serialization
+    hazptr_count_t rcount = claimed_count;
+
     /*
-     * Attempt to acquire the reclamation lock. If exchange returns true (the previous value),
-     * another thread is already reclaiming. memory_order_acquire ensures we observe
-     * changes made by the previous reclaimer.
+     * Outer loop: handles the TOCTOU "Stranded Batch" race iteratively.
+     * After releasing the reclamation lock, a concurrent thread may refund its
+     * count, leaving the threshold exceeded with no active reclaimer. Instead of
+     * recursing (risking stack overflow under sustained load), we loop back to
+     * re-acquire the lock in O(1) stack space.
      */
-    if (atomic_exchange_explicit(&domain->reclaiming, true, memory_order_acquire)) {
-        /*
-         * Contention: Another thread is active. We must return the claimed count
-         * back to the global pool so the active thread can process it later.
-         */
-        if (claimed_count != 0) {
-            atomic_fetch_add_explicit(&domain->retired_count, claimed_count, memory_order_acq_rel);
-        }
-        return;
-    }
-
-    // --- We hold the reclamation lock ---
-
-    // 2. Initialization
-    if (domain->scan_set == nullptr) {
-        // Lazy initialization of the scan set (hash table).
-        domain->scan_set = ptr_set_init();
-        if (!domain->scan_set) {
-            /*
-             * [Refinement]: OOM Handling during initialization.
-             * We cannot proceed with scanning. Instead of aborting the process,
-             * we gracefully abort the reclamation attempt: return the claimed
-             * count and release the lock. This prioritizes system availability.
-             */
-            if (claimed_count != 0) {
-                atomic_fetch_add_explicit(
-                    &domain->retired_count, claimed_count, memory_order_acq_rel);
+    while (true) {
+        // 1. Serialization
+        if (atomic_exchange_explicit(&domain->reclaiming, true, memory_order_acquire)) {
+            if (rcount != 0) {
+                atomic_fetch_add_explicit(&domain->retired_count, rcount, memory_order_acq_rel);
             }
-            // Release the lock before returning.
-            atomic_store_explicit(&domain->reclaiming, false, memory_order_release);
-            fprintf(
-                stderr,
-                "C23 Hazptr Warning: OOM during scan_set initialization. Reclamation aborted.\n");
             return;
         }
-    }
 
-    ptr_set_t*     protected_set = domain->scan_set;
-    hazptr_count_t rcount        = claimed_count; // Local tracker for net change (balance).
+        // --- We hold the reclamation lock ---
 
-    // 3. Iterative Processing (The Reclamation Loop)
-    while (true) {
-        hazptr_obj_t* retired_lists[HP_NUM_SHARDS];
-        bool          extracted_any = false;
+        // 2. Iterative Processing (The Reclamation Loop)
+        while (true) {
+            hazptr_obj_t* retired_lists[HP_NUM_SHARDS];
+            bool          extracted_any = false;
 
-        // 3a. Extraction (X1)
-        for (int i = 0; i < HP_NUM_SHARDS; ++i) {
-            hazptr_shard_t* shard = &domain->shards[i];
-            /*
-             * Atomically swap the head with nullptr.
-             * Acquire ensures visibility of items pushed with release (in hazptr_retire, S2).
-             */
-            retired_lists[i]
-                = atomic_exchange_explicit(&shard->retired_head, nullptr, memory_order_acquire);
-            if (retired_lists[i]) {
-                extracted_any = true;
-            }
-        }
-
-        if (extracted_any) {
-            // 3b. Synchronization Fence (F2).
-            /*
-             * This SeqCst fence synchronizes with F1 (HAZPTR_PROTECT) and F3 (hazptr_retire).
-             * It ensures that we observe all hazard pointers that were set by
-             * other threads before this fence executes in the global SeqCst order.
-             */
-            atomic_thread_fence(memory_order_seq_cst);
-
-            // 3c. Scan
-            // Clear the set from the previous iteration.
-            ptr_set_clear(protected_set);
-            // Load the HP list head (L3). Acquire ensures we see the list structure correctly
-            // (synchronizes with record allocation release).
-            hazptr_rec_t* rec = atomic_load_explicit(&domain->hprec_list, memory_order_acquire);
-            while (rec) {
-                // Load HP value (L4). Acquire synchronizes with the release store (S1) in
-                // hazptr_reset.
-                void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_acquire);
-                if (ptr) {
-                    int absent;
-                    /*
-                     * CRITICAL: OOM during insertion (ptr_set_put).
-                     * If the hash table needs to resize and fails due to OOM, the scan will be
-                     * incomplete, leading to premature reclamation (corruption).
-                     * We rely on the khashl implementation being configured to abort() on
-                     * allocation failure, which is the safest behavior in this critical scenario.
-                     */
-                    ptr_set_put(protected_set, (uintptr_t)ptr, &absent);
-                }
-                rec = rec->next;
-            }
-
-            // 3d. Match and Reclaim
-            hazptr_obj_t* remaining_head = nullptr;
-            hazptr_obj_t* remaining_tail = nullptr;
-
+            // 2a. Extraction (X1)
             for (int i = 0; i < HP_NUM_SHARDS; ++i) {
-                hazptr_obj_t* current = retired_lists[i];
-                while (current) {
-                    hazptr_obj_t* next = current->next_retired;
-
-                    // Check if the pointer exists in the set (kh_end means not found).
-                    if (ptr_set_get(protected_set, (uintptr_t)current) < kh_end(protected_set)) {
-                        // Protected: Keep it. Prepare for restoration.
-                        current->next_retired = nullptr;
-                        if (!remaining_head) {
-                            remaining_head = current;
-                            remaining_tail = current;
-                        } else {
-                            remaining_tail->next_retired = current;
-                            remaining_tail               = current;
-                        }
-                    } else {
-                        // Safe to reclaim.
-                        if (current->reclaim) {
-                            current->reclaim(current);
-                        }
-                        /*
-                         * Adjust the local balance. This can cause 'rcount' to become
-                         * negative if we reclaim more items than initially claimed.
-                         */
-                        rcount--;
-                    }
-                    current = next;
+                hazptr_shard_t* shard = &domain->shards[i];
+                retired_lists[i]
+                    = atomic_exchange_explicit(&shard->retired_head, nullptr, memory_order_acquire);
+                if (retired_lists[i]) {
+                    extracted_any = true;
                 }
             }
 
-            // 3e. Restoration
-            /*
-             * Optimization: Restore remaining objects to a single shard (Shard 0).
-             * This minimizes the number of atomic operations required for restoration.
-             */
-            if (remaining_head) {
-                hazptr_shard_t* shard0 = &domain->shards[0];
-                hazptr_obj_t*   head
-                    = atomic_load_explicit(&shard0->retired_head, memory_order_relaxed);
-                do {
-                    remaining_tail->next_retired = head;
-                } while (!atomic_compare_exchange_weak_explicit(
-                    &shard0->retired_head,
-                    &head,
-                    remaining_head,
-                    memory_order_release, // Success: Make restored items visible.
-                    memory_order_relaxed  // Failure: Reload head.
-                    ));
-                // Note: We do not update the global retired_count here; it's handled by 'rcount'.
+            if (extracted_any) {
+                // 2b. Synchronization Fence (F2).
+                atomic_thread_fence(memory_order_seq_cst);
+
+                // 2c. Scan: Collect protected pointers into a sorted array.
+                size_t max_hps = atomic_load_explicit(&domain->hprec_count, memory_order_acquire);
+                if (max_hps == 0) {
+                    max_hps = 1;
+                }
+
+                // L1 cache fast-path: stack buffer avoids malloc for the common case.
+                void const*  stack_ptrs[128];
+                void const** protected_ptrs = stack_ptrs;
+                size_t       capacity       = 128;
+                bool         on_heap        = false;
+
+                if (max_hps > 128) {
+                    protected_ptrs = malloc(max_hps * sizeof(void*));
+                    if (!protected_ptrs) {
+                        for (int j = 0; j < HP_NUM_SHARDS; ++j) {
+                            if (!retired_lists[j]) {
+                                continue;
+                            }
+                            hazptr_obj_t* tail = retired_lists[j];
+                            while (tail->next_retired) {
+                                tail = tail->next_retired;
+                            }
+                            hazptr_shard_t* shard0 = &domain->shards[0];
+                            hazptr_obj_t*   s0head
+                                = atomic_load_explicit(&shard0->retired_head, memory_order_relaxed);
+                            do {
+                                tail->next_retired = s0head;
+                            } while (!atomic_compare_exchange_weak_explicit(
+                                &shard0->retired_head, &s0head, retired_lists[j],
+                                memory_order_release, memory_order_relaxed));
+                        }
+                        if (rcount != 0) {
+                            atomic_fetch_add_explicit(
+                                &domain->retired_count, rcount, memory_order_acq_rel);
+                        }
+                        atomic_store_explicit(&domain->reclaiming, false, memory_order_release);
+                        fprintf(stderr,
+                                "C23 Hazptr Warning: OOM during reclamation scan. Aborted.\n");
+                        return;
+                    }
+                    capacity = max_hps;
+                    on_heap  = true;
+                }
+
+                size_t hp_count = 0;
+                hazptr_rec_t* rec
+                    = atomic_load_explicit(&domain->hprec_list, memory_order_acquire);
+                while (rec) {
+                    void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_acquire);
+                    if (ptr) {
+                        if (hp_count >= capacity) {
+                            size_t        new_cap = capacity * 2;
+                            void const**  temp    = malloc(new_cap * sizeof(void*));
+                            if (!temp) {
+                                if (on_heap) free(protected_ptrs);
+                                for (int j = 0; j < HP_NUM_SHARDS; ++j) {
+                                    if (!retired_lists[j]) {
+                                        continue;
+                                    }
+                                    hazptr_obj_t* tail = retired_lists[j];
+                                    while (tail->next_retired) {
+                                        tail = tail->next_retired;
+                                    }
+                                    hazptr_shard_t* shard0 = &domain->shards[0];
+                                    hazptr_obj_t*   s0head = atomic_load_explicit(
+                                        &shard0->retired_head, memory_order_relaxed);
+                                    do {
+                                        tail->next_retired = s0head;
+                                    } while (!atomic_compare_exchange_weak_explicit(
+                                        &shard0->retired_head, &s0head, retired_lists[j],
+                                        memory_order_release, memory_order_relaxed));
+                                }
+                                if (rcount != 0) {
+                                    atomic_fetch_add_explicit(
+                                        &domain->retired_count, rcount, memory_order_acq_rel);
+                                }
+                                atomic_store_explicit(
+                                    &domain->reclaiming, false, memory_order_release);
+                                fprintf(stderr,
+                                        "C23 Hazptr Warning: OOM during scan growth. Aborted.\n");
+                                return;
+                            }
+                            memcpy(temp, protected_ptrs, hp_count * sizeof(void*));
+                            if (on_heap) free(protected_ptrs);
+                            protected_ptrs = temp;
+                            capacity       = new_cap;
+                            on_heap        = true;
+                        }
+                        protected_ptrs[hp_count++] = ptr;
+                    }
+                    rec = rec->next;
+                }
+                qsort(protected_ptrs, hp_count, sizeof(void*), ptr_compare);
+
+                // 2d. Match and Reclaim
+                hazptr_obj_t* remaining_head = nullptr;
+                hazptr_obj_t* remaining_tail = nullptr;
+
+                for (int i = 0; i < HP_NUM_SHARDS; ++i) {
+                    hazptr_obj_t* current = retired_lists[i];
+                    while (current) {
+                        hazptr_obj_t* next = current->next_retired;
+
+                        void const* key = (void const*)current;
+                        if (bsearch(&key, protected_ptrs, hp_count, sizeof(void*), ptr_compare)) {
+                            current->next_retired = nullptr;
+                            if (!remaining_head) {
+                                remaining_head = current;
+                                remaining_tail = current;
+                            } else {
+                                remaining_tail->next_retired = current;
+                                remaining_tail               = current;
+                            }
+                        } else {
+                            if (current->reclaim) {
+                                current->reclaim(current);
+                            }
+                            rcount--;
+                        }
+                        current = next;
+                    }
+                }
+
+                if (on_heap) {
+                    free(protected_ptrs);
+                }
+
+                // 2e. Restoration
+                if (remaining_head) {
+                    hazptr_shard_t* shard0 = &domain->shards[0];
+                    hazptr_obj_t*   head
+                        = atomic_load_explicit(&shard0->retired_head, memory_order_relaxed);
+                    do {
+                        remaining_tail->next_retired = head;
+                    } while (!atomic_compare_exchange_weak_explicit(
+                        &shard0->retired_head, &head, remaining_head,
+                        memory_order_release, memory_order_relaxed));
+                }
+            }
+
+            // 2f. Accounting
+            if (rcount != 0) {
+                atomic_fetch_add_explicit(&domain->retired_count, rcount, memory_order_acq_rel);
+            }
+
+            // 2g. Progress Check
+            rcount = domain_check_threshold(domain);
+            if (rcount == 0) {
+                break;
             }
         }
 
-        // 3f. Accounting
-        /*
-         * Apply the net change (claimed - reclaimed) back to the global count.
-         */
-        if (rcount != 0) {
-            atomic_fetch_add_explicit(&domain->retired_count, rcount, memory_order_acq_rel);
-        }
+        // Release the reclamation lock.
+        atomic_store_explicit(&domain->reclaiming, false, memory_order_release);
 
-        // 3g. Progress Check
-        // Check if the threshold is met again due to new arrivals.
+        // TOCTOU Stranded Batch Check — iterative, O(1) stack space.
         rcount = domain_check_threshold(domain);
         if (rcount == 0) {
-            /*
-             * Progress Assurance: The count is below the threshold. However, we must
-             * ensure all shards are truly empty before exiting the serialized phase.
-             * Items might have been added to shards after the count was checked,
-             * and might linger if the retirement rate drops.
-             */
-            bool done = true;
-            for (int i = 0; i < HP_NUM_SHARDS; ++i) {
-                // Acquire load to ensure we see recent additions.
-                if (atomic_load_explicit(&domain->shards[i].retired_head, memory_order_acquire)
-                    != nullptr) {
-                    done = false;
-                    break;
-                }
-            }
-            if (done) {
-                break; // Exit the reclamation loop.
-            }
-            // If not done but rcount is 0, loop again immediately.
+            break; // No stranded batch; exit outer loop.
         }
-        // If rcount > 0, loop again to process the newly claimed batch.
+        // Stranded batch detected; loop back to re-acquire the lock.
     }
-
-    // Release the reclamation lock.
-    // Release semantics ensure all reclamation work (frees) is visible before the lock is released.
-    atomic_store_explicit(&domain->reclaiming, false, memory_order_release);
 }
 
 // ----------------------------------------------------------------------------
@@ -644,10 +605,8 @@ void hazptr_holder_destroy(hazptr_holder_t* h)
         return;
     }
 
-    // Cache full (Slow path). Release to the domain list.
-    // We use the list release function for a single item.
-    rec->next_avail = nullptr;
-    domain_release_hprec_list(rec->domain, rec, rec);
+    // Cache full (Slow path). Release directly by marking inactive.
+    atomic_store_explicit(&rec->active, false, memory_order_release);
     h->hprec = nullptr;
 }
 
@@ -662,14 +621,8 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
     obj->reclaim            = reclaim_fn;
     hazptr_domain_t* domain = &default_domain;
 
-    // Synchronization Fence (F3).
-    /*
-     * This SeqCst fence ensures that the atomic operation which removed the
-     * object from the data structure (which happened before this function call)
-     * is globally visible BEFORE the object is added to the retired list (S2).
-     * This synchronizes with F1 (HAZPTR_PROTECT).
-     */
-    atomic_thread_fence(memory_order_seq_cst);
+    // Guarantee batch flush on thread exit.
+    ensure_thread_registered();
 
     // Push onto the appropriate shard (S2).
     size_t          shard_idx = calc_shard(obj);
@@ -689,13 +642,19 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
                                                     memory_order_relaxed  // Failure
                                                     ));
 
-    // Update centralized count. Acq_rel synchronizes with threshold checks.
-    atomic_fetch_add_explicit(&domain->retired_count, 1, memory_order_acq_rel);
+    // TLS batching: accumulate retirements locally to reduce atomic contention
+    // on the centralized retired_count.
+    local_tc_ptr->retired_batch++;
+    if (local_tc_ptr->retired_batch >= HP_TLC_BATCH_SIZE) {
+        atomic_fetch_add_explicit(
+            &domain->retired_count, (hazptr_count_t)local_tc_ptr->retired_batch, memory_order_acq_rel);
+        local_tc_ptr->retired_batch = 0;
 
-    // Check threshold and potentially trigger reclamation via CAS Handoff.
-    hazptr_count_t rcount = domain_check_threshold(domain);
-    if (rcount > 0) {
-        domain_do_reclamation(domain, rcount);
+        // Check threshold and potentially trigger reclamation via CAS Handoff.
+        hazptr_count_t rcount = domain_check_threshold(domain);
+        if (rcount > 0) {
+            domain_do_reclamation(domain, rcount);
+        }
     }
 }
 

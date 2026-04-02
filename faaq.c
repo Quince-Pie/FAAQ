@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 
 // Reclamation function called by the HP library when the node is safe to
@@ -20,7 +21,7 @@ static void node_reclaim(hazptr_obj_t* obj)
 
 static Node_t* create_node(void* initial_item)
 {
-    Node_t* node = malloc(sizeof(Node_t));
+    Node_t* node = aligned_alloc(FAA_ALIGNMENT, sizeof(Node_t));
     if (!node) {
         perror("C23 FAAQueue Fatal Error: Failed to allocate Node_t");
         abort(); // Fatal error in lock-free allocation
@@ -31,7 +32,7 @@ static Node_t* create_node(void* initial_item)
     atomic_init(&node->deqidx, 0);
     atomic_init(&node->next, nullptr);
 
-    int start_idx;
+    size_t start_idx;
 
     if (initial_item != nullptr) {
         atomic_init(&node->enqidx, 1);
@@ -42,8 +43,13 @@ static Node_t* create_node(void* initial_item)
         start_idx = 0;
     }
 
-    for (size_t i = start_idx; i < FAA_BUFFER_SIZE; i++) {
-        atomic_init(&node->items[i], nullptr);
+    // The node is thread-local until published via CAS to ltail->next, so
+    // data races are impossible. memset enables SIMD vectorization (~30x faster
+    // than 1024 scalar atomic_init calls). Safe on all target platforms where
+    // _Atomic(void*) has the same representation as void* and nullptr is all-zero.
+    if (start_idx < FAA_BUFFER_SIZE) {
+        memset((void*)&node->items[start_idx], 0,
+               (FAA_BUFFER_SIZE - start_idx) * sizeof(node->items[0]));
     }
 
     return node;
@@ -89,7 +95,7 @@ FAAArrayQueue_t* faa_queue_create(int max_threads)
     return q;
 }
 
-void faa_queue_destroy(FAAArrayQueue_t* q)
+void faa_queue_destroy(FAAArrayQueue_t* q, void (*free_payload)(void*))
 {
     if (!q) {
         return;
@@ -97,8 +103,12 @@ void faa_queue_destroy(FAAArrayQueue_t* q)
 
     // Drain the queue. We use TID 0 arbitrarily, assuming quiescence and
     // max_threads > 0.
-    while (faa_queue_dequeue(q, 0) != nullptr)
-        ;
+    void* item;
+    while ((item = faa_queue_dequeue(q, 0)) != nullptr) {
+        if (free_payload) {
+            free_payload(item);
+        }
+    }
 
     Node_t* sentinel = atomic_load_explicit(&q->head, memory_order_relaxed);
     if (sentinel) {
@@ -151,6 +161,21 @@ void faa_queue_enqueue(FAAArrayQueue_t* q, void* item, int tid)
         // 1. Protect the tail pointer using the C23 HP macro.
         HAZPTR_PROTECT(ltail, h, &q->tail);
         // 'h' now protects 'ltail'.
+
+        // Saturation guard: if the node is already exhausted AND a successor
+        // exists, skip the costly fetch_add and passively help swing the tail.
+        // If no successor exists, we must fall through to the fetch_add so we
+        // can enter the slow path and create the next node.
+        if (atomic_load_explicit(&ltail->enqidx, memory_order_relaxed) >= FAA_BUFFER_SIZE) {
+            Node_t* lnext = atomic_load_explicit(&ltail->next, memory_order_acquire);
+            if (lnext) {
+                atomic_compare_exchange_strong_explicit(
+                    &q->tail, &ltail, lnext, memory_order_release, memory_order_relaxed);
+                hazptr_reset(h, nullptr);
+                continue;
+            }
+        }
+
         size_t const idx = atomic_fetch_add_explicit(&ltail->enqidx, 1, memory_order_relaxed);
 
         if (idx >= FAA_BUFFER_SIZE) {
@@ -169,17 +194,17 @@ void faa_queue_enqueue(FAAArrayQueue_t* q, void* item, int tid)
                 Node_t* new_node = create_node(item);
 
                 Node_t* expected_next = nullptr;
-                if (atomic_compare_exchange_weak_explicit(&ltail->next,
-                                                          &expected_next,
-                                                          new_node,
-                                                          memory_order_release,
-                                                          memory_order_relaxed)) {
+                if (atomic_compare_exchange_strong_explicit(&ltail->next,
+                                                            &expected_next,
+                                                            new_node,
+                                                            memory_order_release,
+                                                            memory_order_relaxed)) {
                     // Success: Attached new node. Now try to swing the tail (helping).
-                    atomic_compare_exchange_weak_explicit(&q->tail,
-                                                          &ltail, // Expected value
-                                                          new_node,
-                                                          memory_order_release,
-                                                          memory_order_relaxed);
+                    atomic_compare_exchange_strong_explicit(&q->tail,
+                                                            &ltail, // Expected value
+                                                            new_node,
+                                                            memory_order_release,
+                                                            memory_order_relaxed);
 
                     // Clear hazard pointer and return.
                     hazptr_reset(h, nullptr);
@@ -191,7 +216,7 @@ void faa_queue_enqueue(FAAArrayQueue_t* q, void* item, int tid)
                     // Continue the loop to retry.
                 }
             } else {
-                atomic_compare_exchange_weak_explicit(
+                atomic_compare_exchange_strong_explicit(
                     &q->tail, &ltail, lnext, memory_order_release, memory_order_relaxed);
             }
             // Must retry the enqueue operation. Reset HP before retry.
@@ -202,9 +227,11 @@ void faa_queue_enqueue(FAAArrayQueue_t* q, void* item, int tid)
         // --- We have a valid index (Fast path) ---
 
         // 3. Try to store the item in the claimed slot.
-        void* expected = nullptr;
+        size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
+        void*        expected     = nullptr;
         if (atomic_compare_exchange_strong_explicit(
-                &ltail->items[idx], &expected, item, memory_order_release, memory_order_relaxed)) {
+                &ltail->items[physical_idx], &expected, item, memory_order_release,
+                memory_order_relaxed)) {
             // Success! Item enqueued.
             hazptr_reset(h, nullptr);
             return;
@@ -242,9 +269,31 @@ void* faa_queue_dequeue(FAAArrayQueue_t* q, int tid)
 
         // If the current node seems empty AND there is no next node, the queue is
         // likely empty.
-        if (deq_idx >= enq_idx && lnext == nullptr) {
+        if ((ptrdiff_t)(deq_idx - enq_idx) >= 0 && lnext == nullptr) {
             // Appears empty and is the last node.
             break;
+        }
+
+        // Saturation guard: if the node is already drained, skip the costly
+        // fetch_add and passively help advance the head pointer.
+        if (deq_idx >= FAA_BUFFER_SIZE) {
+            lnext = atomic_load_explicit(&lhead->next, memory_order_acquire);
+            if (lnext == nullptr) {
+                break;
+            }
+            Node_t* current_tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+            if (current_tail == lhead) {
+                atomic_compare_exchange_strong_explicit(
+                    &q->tail, &current_tail, lnext, memory_order_release, memory_order_relaxed);
+            }
+            if (atomic_compare_exchange_strong_explicit(
+                    &q->head, &lhead, lnext, memory_order_release, memory_order_relaxed)) {
+                hazptr_reset(h, nullptr);
+                hazptr_retire(&lhead->hp_base, node_reclaim);
+            } else {
+                hazptr_reset(h, nullptr);
+            }
+            continue;
         }
 
         // 2. Claim an index using FAA.
@@ -260,6 +309,14 @@ void* faa_queue_dequeue(FAAArrayQueue_t* q, int tid)
             if (lnext == nullptr) {
                 // Still no next node. Queue is empty.
                 break;
+            }
+
+            // Ensure tail doesn't lag before retiring head.
+            // Prevents a dangling tail pointer to freed memory (UAF).
+            Node_t* current_tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+            if (current_tail == lhead) {
+                atomic_compare_exchange_strong_explicit(
+                    &q->tail, &current_tail, lnext, memory_order_release, memory_order_relaxed);
             }
 
             // Try to advance the head pointer.
@@ -286,18 +343,37 @@ void* faa_queue_dequeue(FAAArrayQueue_t* q, int tid)
 
         // --- We have a valid index (Fast path) ---
 
-        // 3. Retrieve the item and mark the slot as taken simultaneously using
-        // Exchange.
-        void* item = atomic_exchange_explicit(&lhead->items[idx],
-                                              taken,
-                                              memory_order_acquire); // NEW
+        // 3. Spin-wait for the enqueuer to fill the slot, then retrieve the item.
+        // The enqueuer mathematically owns the slot via enqidx, so spinning
+        // briefly avoids the heavy atomic_exchange and prevents premature
+        // slot voiding under contention.
+        size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
+        void*        item         = nullptr;
+        int          spin_limit   = 2000;
 
-        if (item == nullptr) {
-            // The slot was empty. The enqueuer claimed the slot (FAA) but hasn't
-            // stored the item (CAS) yet. We must retry the dequeue operation. Reset
-            // HP before retry.
-            hazptr_reset(h, nullptr);
+        while (true) {
+            item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
+            if (item != nullptr) {
+                break;
+            }
+
+            if (--spin_limit == 0) {
+                // Enqueuer genuinely stalled. Void the slot to guarantee wait-freedom.
+                item = atomic_exchange_explicit(&lhead->items[physical_idx], taken,
+                                                memory_order_acquire);
+                break;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#else
             thrd_yield();
+#endif
+        }
+
+        if (item == nullptr || item == taken) {
+            hazptr_reset(h, nullptr);
             continue;
         }
 

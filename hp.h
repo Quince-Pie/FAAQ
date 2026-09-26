@@ -31,6 +31,9 @@
 #define HP_RCOUNT_THRESHOLD 1000 // Base threshold for reclamation (R).
 #define HP_HCOUNT_MULTIPLIER 2   // Dynamic threshold multiplier (K). Threshold = max(R, H*K).
 #define HP_TLC_BATCH_SIZE 16     // Retirement count batch size for TLS batching.
+#ifndef HP_LOCAL_SCAN_INTERVAL
+#define HP_LOCAL_SCAN_INTERVAL 2048 // Retirements between scans of a thread's local retired list.
+#endif
 
 // Constraint: HP_NUM_SHARDS must be a power of 2 for efficient indexing via masking.
 static_assert((HP_NUM_SHARDS > 0) && ((HP_NUM_SHARDS & (HP_NUM_SHARDS - 1)) == 0),
@@ -82,6 +85,23 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn);
  * procedures or testing. This may block if another thread is currently reclaiming.
  */
 void hazptr_cleanup(void);
+
+/**
+ * @brief Releases the calling thread's hazard pointer resources.
+ *
+ * Returns cached HP records to the domain and hands the thread's retired
+ * objects over to it. Runs automatically at thread exit (tss destructor) for
+ * every thread that used a holder or retired an object; calling it manually is
+ * only needed for a thread that wants to give its resources back early.
+ * Idempotent; the thread may keep using hazard pointers afterwards.
+ */
+void hazptr_thread_exit(void);
+
+/**
+ * @brief Number of HP records ever allocated in the default domain
+ * (active + inactive). Observability hook for tests; O(1).
+ */
+size_t hazptr_record_count(void);
 
 /*
  * Hazard Pointer Record. Stores a single protected pointer.

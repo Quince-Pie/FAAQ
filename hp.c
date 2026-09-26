@@ -108,6 +108,7 @@ typedef struct
     hazptr_obj_t* retired_list;  // Thread-local retired list.
     size_t        retired_count; // Number of retired objects in the local list.
     size_t        newly_retired; // Number of objects retired since last scan.
+    bool          registered;    // tss destructor armed for this thread.
 } hazptr_tc_t;
 
 /*
@@ -120,8 +121,10 @@ static thread_local hazptr_tc_t local_tc = {};
 // Forward Declarations (Internal)
 // ----------------------------------------------------------------------------
 
-static hazptr_rec_t* domain_acquire_hprec(hazptr_domain_t* domain);
-static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claimed_count);
+static hazptr_rec_t*  domain_acquire_hprec(hazptr_domain_t* domain);
+static void           domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claimed_count);
+static hazptr_count_t domain_check_threshold(hazptr_domain_t* domain);
+static void           tc_do_reclamation(hazptr_tc_t* tc);
 
 // ----------------------------------------------------------------------------
 // Thread Local Cache (TLC) Management
@@ -157,6 +160,83 @@ static void tlc_flush(hazptr_tc_t* tc)
         tc->retired_list = nullptr;
         tc->retired_count = 0;
     }
+}
+
+// ----------------------------------------------------------------------------
+// Thread Registration (automatic cleanup at thread exit)
+// ----------------------------------------------------------------------------
+
+static tss_t        hazptr_tss_key;
+static _Atomic(int) hazptr_tss_state; // 0 = key not created, 1 = creating, 2 = ready
+
+static void hazptr_tss_dtor(void* data)
+{
+    (void)data;
+    hazptr_thread_exit();
+}
+
+// call_once() would do, but glibc implements it through an internal
+// pthread_once that ThreadSanitizer cannot see; a two-phase atomic gives the
+// same guarantee and keeps TSan builds clean.
+static void hazptr_tss_key_once(void)
+{
+    if (atomic_load_explicit(&hazptr_tss_state, memory_order_acquire) == 2) {
+        return;
+    }
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&hazptr_tss_state, &expected, 1, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        if (tss_create(&hazptr_tss_key, hazptr_tss_dtor) != thrd_success) {
+            fprintf(stderr, "C23 Hazptr Fatal Error: tss_create failed.\n");
+            abort();
+        }
+        atomic_store_explicit(&hazptr_tss_state, 2, memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&hazptr_tss_state, memory_order_acquire) != 2) {
+        thrd_yield();
+    }
+}
+
+/*
+ * Arms the tss destructor for the calling thread (once per thread). Without
+ * it, a thread that exits leaves its cached HP records active forever and its
+ * retired objects unreclaimable.
+ */
+static inline void ensure_thread_registered(void)
+{
+    hazptr_tc_t* tc = &local_tc;
+    if (tc->registered) {
+        return;
+    }
+    hazptr_tss_key_once();
+    if (tss_set(hazptr_tss_key, tc) != thrd_success) {
+        fprintf(stderr, "C23 Hazptr Fatal Error: tss_set failed.\n");
+        abort();
+    }
+    tc->registered = true;
+}
+
+void hazptr_thread_exit(void)
+{
+    hazptr_tc_t*     tc     = &local_tc;
+    hazptr_domain_t* domain = &default_domain;
+
+    tlc_flush(tc);
+    tc->newly_retired = 0;
+    tc->registered    = false; // a later use re-arms the destructor
+
+    // The hand-over may have pushed the domain over its threshold; reclaim now
+    // rather than leaving the backlog to the next hazptr_cleanup() call.
+    hazptr_count_t const claimed = domain_check_threshold(domain);
+    if (claimed > 0) {
+        domain_do_reclamation(domain, claimed);
+    }
+}
+
+size_t hazptr_record_count(void)
+{
+    return atomic_load_explicit(&default_domain.hprec_count, memory_order_acquire);
 }
 
 
@@ -238,19 +318,6 @@ static hazptr_rec_t* domain_acquire_hprec(hazptr_domain_t* domain)
 // ----------------------------------------------------------------------------
 // Reclamation Mechanism
 // ----------------------------------------------------------------------------
-
-/*
- * Helper to calculate the shard index based on the pointer address.
- */
-static inline size_t calc_shard(void const* ptr)
-{
-    uintptr_t x = (uintptr_t)ptr;
-    // Faster, low-latency hash mixing for pointers
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    return (size_t)((x * 0x2545F4914F6CDD1DULL) >> 61) % HP_NUM_SHARDS;
-}
 
 /*
  * Calculates the dynamic reclamation threshold.
@@ -405,7 +472,7 @@ static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claime
                 hazptr_rec_t* rec
                     = atomic_load_explicit(&domain->hprec_list, memory_order_acquire);
                 while (rec) {
-                    void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_relaxed);
+                    void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_acquire);
                     if (ptr) {
                         if (hp_count >= capacity) {
                             size_t        new_cap = capacity * 2;
@@ -544,6 +611,8 @@ static void domain_do_reclamation(hazptr_domain_t* domain, hazptr_count_t claime
 
 void hazptr_holder_init(hazptr_holder_t* h)
 {
+    ensure_thread_registered();
+
     // We optimize TLC for the default domain.
     hazptr_domain_t* domain = &default_domain;
 
@@ -613,7 +682,7 @@ static void tc_do_reclamation(hazptr_tc_t* tc)
     size_t hp_count = 0;
     hazptr_rec_t* rec = atomic_load_explicit(&domain->hprec_list, memory_order_acquire);
     while (rec) {
-        void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_relaxed);
+        void const* ptr = atomic_load_explicit(&rec->ptr, memory_order_acquire);
         if (ptr) {
             if (hp_count >= capacity) {
                 size_t        new_cap = capacity * 2;
@@ -685,7 +754,9 @@ static void tc_do_reclamation(hazptr_tc_t* tc)
     tc->retired_count = remaining_count;
 }
 
-void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
+// Out of line on purpose: it runs once per node, and inlined (LTO) it drags its
+// batch counters' vector update into every caller's prologue.
+__attribute__((noinline)) void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
 {
     if (!obj) {
         return;
@@ -693,6 +764,7 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
 
     obj->reclaim = reclaim_fn;
 
+    ensure_thread_registered();
     hazptr_tc_t* tc = &local_tc;
 
     // Push onto the thread-local retired list (zero contention!).
@@ -701,7 +773,7 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
     tc->retired_count++;
 
     tc->newly_retired++;
-    if (tc->newly_retired >= 2048) {
+    if (tc->newly_retired >= HP_LOCAL_SCAN_INTERVAL) {
         tc_do_reclamation(tc);
         tc->newly_retired = 0;
     }
@@ -710,6 +782,14 @@ void hazptr_retire(hazptr_obj_t* obj, hazptr_reclaim_fn reclaim_fn)
 void hazptr_cleanup(void)
 {
     hazptr_domain_t* domain = &default_domain;
+
+    // The caller's own retired list first: it is the only place its recently
+    // retired objects can be, and only this thread may touch it.
+    hazptr_tc_t* tc = &local_tc;
+    if (tc->retired_list) {
+        tc_do_reclamation(tc);
+        tc->newly_retired = 0;
+    }
 
     /*
      * Force a reclamation cycle by manually performing a CAS handoff:

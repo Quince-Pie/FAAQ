@@ -1,27 +1,21 @@
 # Fast FAA Array Queue
 
-A fast, lock-free, multi-producer, multi-consumer (MPMC) queue implementation in C. It uses a Fetch-And-Add (FAA) strategy on array indices for high throughput and relies on a hazard pointer implementation for safe memory reclamation. This is a slightly modified version of [FAAArrayQueue](https://concurrencyfreaks.blogspot.com/2016/11/faaarrayqueue-mpmc-lock-free-queue-part.html) ported to C23.
+A fast, lock-free, multi-producer, multi-consumer (MPMC) queue implementation in C23. It uses a Fetch-And-Add (FAA) strategy on array indices for high throughput and relies on a hazard pointer implementation for safe memory reclamation. This is a modified version of [FAAArrayQueue](https://concurrencyfreaks.blogspot.com/2016/11/faaarrayqueue-mpmc-lock-free-queue-part.html) ported to C23.
 
 ## USAGE
 
-The API is simple and requires the user to manage thread IDs for concurrent operations.
+The API has no thread ids and no thread registration: any number of threads may use any queue at any time. Each thread lazily attaches per-queue state (two hazard pointers) on first use, caches it for its most recently used queues, and releases it automatically when the thread exits or when the queue is destroyed.
 
 ### 1\. Creation
 
-First, create a queue instance. You must specify the maximum number of threads that will ever access the queue concurrently. This is essential for the underlying memory safety mechanism (hazard pointers).
-
 ```c
-FAAArrayQueue_t *faa_queue_create(int max_threads);
+FAAArrayQueue_t *faa_queue_create(void);
 ```
 
-  * `max_threads`: The maximum number of concurrent threads that will use the queue. Must be greater than 0.
-  * **Returns**: A pointer to the initialized queue, or `NULL` on failure.
-
-**Example:**
+  * **Returns**: A pointer to the initialized queue, or `nullptr` on allocation failure.
 
 ```c
-#define NUM_THREADS 8
-FAAArrayQueue_t* my_queue = faa_queue_create(NUM_THREADS);
+FAAArrayQueue_t* my_queue = faa_queue_create();
 if (!my_queue) {
     // Handle creation failure
 }
@@ -29,101 +23,100 @@ if (!my_queue) {
 
 ### 2\. Enqueue
 
-Add an item to the tail of the queue. This operation is lock-free and safe to call from multiple threads concurrently.
+Add an item to the tail of the queue. Lock-free; safe to call from any number of threads concurrently.
 
 ```c
-void faa_queue_enqueue(FAAArrayQueue_t *q, void *item, int tid);
+void faa_queue_enqueue(FAAArrayQueue_t *q, void *item);
 ```
 
-  * `q`: A pointer to the queue.
-  * `item`: The pointer to the item to be enqueued. It must not be `NULL`.
-  * `tid`: The unique thread ID of the calling thread. This ID must be in the range `[0, max_threads - 1]`. Each concurrent thread must have its own unique `tid`.
-
-**Example:**
+  * `item`: The pointer to enqueue. `nullptr` is ignored (`nullptr` is what dequeue returns for "empty").
 
 ```c
-// In producer thread with tid = 0
 int* my_data = malloc(sizeof(int));
 *my_data = 123;
-faa_queue_enqueue(my_queue, my_data, 0);
+faa_queue_enqueue(my_queue, my_data);
 ```
 
 ### 3\. Dequeue
 
-Remove an item from the head of the queue. This operation is lock-free and safe to call from multiple threads concurrently.
+Remove an item from the head of the queue. Lock-free; safe to call from any number of threads concurrently.
 
 ```c
-void *faa_queue_dequeue(FAAArrayQueue_t *q, int tid);
+void *faa_queue_dequeue(FAAArrayQueue_t *q);
 ```
 
-  * `q`: A pointer to the queue.
-  * `tid`: The unique thread ID of the calling thread. This ID must be in the range `[0, max_threads - 1]`.
-  * **Returns**: A pointer to the dequeued item, or `NULL` if the queue was empty.
-
-**Example:**
+  * **Returns**: The dequeued item, or `nullptr` if the queue was empty. The result is `[[nodiscard]]`.
 
 ```c
-// In consumer thread with tid = 1
-int* received_data = (int*)faa_queue_dequeue(my_queue, 1);
-if (received_data != NULL) {
-    printf("Dequeued: %d\n", *received_data);
-    free(received_data);
+int* received = faa_queue_dequeue(my_queue);
+if (received != nullptr) {
+    printf("Dequeued: %d\n", *received);
+    free(received);
 }
 ```
 
 ### 4\. Destruction
 
-Free all memory associated with the queue. This function should **only** be called when no other threads are accessing the queue (i.e., after all producer/consumer threads have been joined). It will drain any remaining items in the queue before freeing memory.
+Free all memory associated with the queue. Call it only when no other thread is accessing the queue (after all producer/consumer threads have been joined). Remaining items are drained in FIFO order through `free_payload` (if non-null) before the memory is freed.
 
 ```c
-void faa_queue_destroy(FAAArrayQueue_t *q);
+void faa_queue_destroy(FAAArrayQueue_t *q, void (*free_payload)(void *));
 ```
 
-  * `q`: A pointer to the queue.
-
-**Example:**
-
 ```c
-// After all threads are joined
-faa_queue_destroy(my_queue);
+faa_queue_destroy(my_queue, free);
 ```
 
 ### Complete Example
 
-Here is a simple, single-threaded example demonstrating the complete lifecycle.
-
 ```c
-#include <stdio.h>
 #include <assert.h>
 #include <stdint.h>
-#include "faa_array_queue.h"
+#include <stdio.h>
+#include "faaq.h"
 
-int main() {
-    // 1. Create for 1 thread
-    FAAArrayQueue_t* q = faa_queue_create(1);
-    assert(q != NULL);
+int main(void) {
+    FAAArrayQueue_t* q = faa_queue_create();
+    assert(q != nullptr);
 
-    // 2. Enqueue items (using integers as data for simplicity)
-    faa_queue_enqueue(q, (void*)10, 0);
-    faa_queue_enqueue(q, (void*)20, 0);
+    faa_queue_enqueue(q, (void*)10);
+    faa_queue_enqueue(q, (void*)20);
 
-    // 3. Dequeue items
-    void* item1 = faa_queue_dequeue(q, 0);
-    void* item2 = faa_queue_dequeue(q, 0);
+    void* item1 = faa_queue_dequeue(q);
+    void* item2 = faa_queue_dequeue(q);
 
     printf("Dequeued: %ld\n", (intptr_t)item1); // Prints 10
     printf("Dequeued: %ld\n", (intptr_t)item2); // Prints 20
+    assert(faa_queue_dequeue(q) == nullptr);   // empty
 
-    assert((intptr_t)item1 == 10);
-    assert((intptr_t)item2 == 20);
-
-    // 4. Destroy the queue
-    faa_queue_destroy(q);
-
+    faa_queue_destroy(q, nullptr);
     return 0;
 }
 ```
 
+See `example.c` for a multi-threaded producer/consumer example.
+
+## How the per-thread state works (why there is no `tid`)
+
+The original FAAArrayQueue takes a thread id because its hazard pointers live in a per-queue array indexed by `tid`. Here that state lives in the thread instead:
+
+  * Each thread has a small thread-local cache (`FAAQ_TLS_SLOTS`, default 4, most-recently-used first) of per-queue entries: two hazard pointers plus the last head and tail node it protected. The hot path is one thread-local compare of the queue's id against the front entry.
+  * Queues carry a process-unique 64-bit id that is never reused, so an entry left behind by a destroyed queue can never match a new queue allocated at the same address.
+  * A thread that touches more queues than it has slots evicts the least recently used entry (correct, just slower). A thread that exits releases everything through a C23 `tss_t` destructor; hazard pointer records are recycled for later threads.
+  * Stale entries for a destroyed queue in *other* threads are inert; until they are evicted or the thread exits, each one pins at most two node-sized allocations from reuse. This is the one resource cost of the design.
+
+Reclaimed nodes are cached per thread (`FAAQ_NODE_CACHE_CAPACITY`, default 256) and freed at thread exit.
+
+## Building and testing
+
+```
+make test          # ASan + UBSan build of test_faaq.c, then run
+make tsan          # ThreadSanitizer build of the suite and of the fuzz harness, then run
+make bench         # -O3 -flto benchmark driver: ./bench_faaq [-s sec] [-t 1,2,4] [-w sym|pc|both] [-r reps] [-p]
+make example
+```
+
+`test_faaq.c` covers teardown/leaks, a deterministic regression for a thread whose cached head node was drained and unlinked by other threads, many queues per thread (slot eviction), 300 short-lived threads (hazard pointer record recycling), exact-once MPMC delivery at 4+4 and 16+16 threads, and a scaling benchmark. Under ThreadSanitizer the suite shrinks the concurrent phases (1/20 scale, and 8+8 threads at 1/100 for the oversubscribed one: TSan serializes every atomic through per-address locks, and 32 polling threads turn that into a convoy) and routes thread creation through pthreads (`test_threads.h`), because glibc's `thrd_create` calls its pthread internals directly and bypasses TSan's interceptors.
 
 ## References
 
@@ -132,5 +125,3 @@ This work is directly inspired by:
 - The CPP implementation of [FAAArrayQueue](https://concurrencyfreaks.blogspot.com/2016/11/faaarrayqueue-mpmc-lock-free-queue-part.html)
 
 - Folly's Hazard Pointer Implementation [folly](https://github.com/facebook/folly)
-
-Additionally, the implementation of hazard pointers make use of [khashl](https://github.com/attractivechaos/khashl/blob/main/khashl.h) for faster reclaimation process.

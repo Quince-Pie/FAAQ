@@ -22,27 +22,24 @@ void
 run_simple_example() {
     printf("--- Running Simple Single-Threaded Example ---\n");
 
-    // Create a queue for a single thread.
-    // The `max_threads` parameter is crucial for the underlying hazard
-    // pointer system to allocate resources for memory safety.
-    int              max_threads = 1;
-    FAAArrayQueue_t *q           = faa_queue_create(max_threads);
+    // Create a queue. Nothing about the threads that will use it needs to be
+    // declared up front: each thread attaches itself on first use.
+    FAAArrayQueue_t *q = faa_queue_create();
     assert(q != NULL);
     printf("Queue created successfully.\n");
 
     // Enqueue some items.
     // For this simple example, we cast integers to void pointers.
-    // The thread ID (tid) is 0 since we only have one thread.
     printf("Enqueuing items: 10, 20, 30\n");
-    faa_queue_enqueue(q, (void *) 10, 0);
-    faa_queue_enqueue(q, (void *) 20, 0);
-    faa_queue_enqueue(q, (void *) 30, 0);
+    faa_queue_enqueue(q, (void *) 10);
+    faa_queue_enqueue(q, (void *) 20);
+    faa_queue_enqueue(q, (void *) 30);
 
     // Dequeue items and verify FIFO order.
-    void *item1      = faa_queue_dequeue(q, 0);
-    void *item2      = faa_queue_dequeue(q, 0);
-    void *item3      = faa_queue_dequeue(q, 0);
-    void *empty_item = faa_queue_dequeue(q, 0);
+    void *item1      = faa_queue_dequeue(q);
+    void *item2      = faa_queue_dequeue(q);
+    void *item3      = faa_queue_dequeue(q);
+    void *empty_item = faa_queue_dequeue(q);
 
     printf("Dequeued items: %ld, %ld, %ld\n", (intptr_t) item1, (intptr_t) item2, (intptr_t) item3);
     assert((intptr_t) item1 == 10);
@@ -62,27 +59,27 @@ run_simple_example() {
 
 int
 producer_thread(void *arg) {
-    int tid = (int) (intptr_t) arg;
-    printf("Producer thread %d started.\n", tid);
+    int id = (int) (intptr_t) arg;
+    printf("Producer thread %d started.\n", id);
 
     for (int i = 0; i < ITEMS_PER_PRODUCER; ++i) {
         // In a real application, you would allocate memory for your data.
         // We'll enqueue the item's number, ensuring it's not NULL.
         intptr_t value = (intptr_t) (i + 1);
-        faa_queue_enqueue(g_queue, (void *) value, tid);
+        faa_queue_enqueue(g_queue, (void *) value);
     }
 
-    printf("Producer thread %d finished.\n", tid);
+    printf("Producer thread %d finished.\n", id);
     return 0;
 }
 
 int
 consumer_thread(void *arg) {
-    int tid = (int) (intptr_t) arg;
-    printf("Consumer thread %d started.\n", tid);
+    int id = (int) (intptr_t) arg;
+    printf("Consumer thread %d started.\n", id);
 
     while (atomic_load(&g_dequeued_count) < (NUM_PRODUCERS * ITEMS_PER_PRODUCER)) {
-        void *item = faa_queue_dequeue(g_queue, tid);
+        void *item = faa_queue_dequeue(g_queue);
         if (item != NULL) {
             // In a real application, you would process the item here.
             // If the item was dynamically allocated, you would free it.
@@ -92,7 +89,7 @@ consumer_thread(void *arg) {
             thrd_yield();
         }
     }
-    printf("Consumer thread %d finished.\n", tid);
+    printf("Consumer thread %d finished.\n", id);
     return 0;
 }
 
@@ -101,21 +98,18 @@ run_multithread_example() {
     printf("--- Running Multi-Threaded Example ---\n");
     printf("%d Producers, %d Consumers, %d Items per Producer\n", NUM_PRODUCERS, NUM_CONSUMERS, ITEMS_PER_PRODUCER);
 
-    // Create a queue that can be safely accessed by all our threads.
-    g_queue = faa_queue_create(TOTAL_THREADS);
+    // Any number of threads may use the queue; no ids, no registration.
+    g_queue = faa_queue_create();
     assert(g_queue != NULL);
 
     thrd_t threads[TOTAL_THREADS];
 
     // Create and start producer and consumer threads.
-    // Thread IDs must be unique and in the range [0, max_threads - 1].
     for (int i = 0; i < NUM_PRODUCERS; ++i) {
-        int tid = i;
-        thrd_create(&threads[tid], producer_thread, (void *) (intptr_t) tid);
+        thrd_create(&threads[i], producer_thread, (void *) (intptr_t) i);
     }
     for (int i = 0; i < NUM_CONSUMERS; ++i) {
-        int tid = NUM_PRODUCERS + i;
-        thrd_create(&threads[tid], consumer_thread, (void *) (intptr_t) tid);
+        thrd_create(&threads[NUM_PRODUCERS + i], consumer_thread, (void *) (intptr_t) i);
     }
 
     // Wait for all threads to complete.
@@ -130,7 +124,7 @@ run_multithread_example() {
     printf("Total items dequeued: %llu\n", (unsigned long long) total_dequeued);
     printf("Total items expected: %llu\n", (unsigned long long) total_expected);
     assert(total_dequeued == total_expected);
-    assert(faa_queue_dequeue(g_queue, 0) == NULL); // Queue should be empty now
+    assert(faa_queue_dequeue(g_queue) == NULL); // Queue should be empty now
     printf("Verification successful.\n");
 
     // Destroy the queue.

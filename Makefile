@@ -1,25 +1,48 @@
-CC = gcc
-# Enforce strict C23 compliance, maximal architecture optimizations
-CFLAGS_BASE = -std=c2x -march=native -Wall -Wextra -Wpedantic
-LDFLAGS = -lpthread
+# C23 FAA array queue: test and benchmark targets. GNU Make 4.4.
+#
+#   make test        ASan+UBSan build of the validation suite, then run it
+#   make tsan        ThreadSanitizer build of the suite, then run it
+#   make bench       -O3 -flto benchmark driver (./bench_faaq -h for options)
 
-# Targets
-TARGET_TEST = test_faaq
-TARGET_BENCH = bench_faaq
+CC       ?= gcc
 
-# ASan for rigorous memory leak testing in the Hazard Pointer system
-CFLAGS_TEST = $(CFLAGS_BASE) -O1 -fsanitize=address -g3 -fno-omit-frame-pointer
-CFLAGS_BENCH = $(CFLAGS_BASE) -O3 -flto -DNDEBUG
+STD      := -std=c23
+WARN     := -Wall -Wextra -Wpedantic
+LDLIBS   := -lpthread
 
-SRCS = test_faaq.c faaq.c hp.c
+SRCS     := faaq.c hp.c
+HDRS     := faaq.h hp.h test_threads.h
 
-all: test bench
+SAN      := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-test: $(SRCS)
-	$(CC) $(CFLAGS_TEST) $^ -o $(TARGET_TEST) $(LDFLAGS)
+.PHONY: all test tsan bench example clean
 
-bench: $(SRCS)
-	$(CC) $(CFLAGS_BENCH) $^ -o $(TARGET_BENCH) $(LDFLAGS)
+all: test_faaq bench_faaq example
+
+# --- correctness ------------------------------------------------------------
+
+test_faaq: test_faaq.c $(SRCS) $(HDRS)
+	$(CC) $(STD) $(WARN) -O1 -g3 $(SAN) test_faaq.c $(SRCS) -o $@ $(LDLIBS)
+
+test: test_faaq
+	./test_faaq
+
+tsan_test_faaq: test_faaq.c $(SRCS) $(HDRS)
+	$(CC) $(STD) $(WARN) -O1 -g -fsanitize=thread test_faaq.c $(SRCS) -o $@ $(LDLIBS)
+
+tsan: tsan_test_faaq
+	FAAQ_TEST_NO_BENCH=1 ./tsan_test_faaq
+
+# --- performance -------------------------------------------------------------
+
+bench_faaq: bench_faaq.c $(SRCS) $(HDRS)
+	$(CC) $(STD) $(WARN) -O3 -flto -DNDEBUG bench_faaq.c $(SRCS) -o $@ $(LDLIBS)
+
+bench: bench_faaq
+	./bench_faaq -s 2 -t 1,2,4,8,16
+
+example: example.c $(SRCS) $(HDRS)
+	$(CC) $(STD) $(WARN) -O2 example.c $(SRCS) -o $@ $(LDLIBS)
 
 clean:
-	rm -f $(TARGET_TEST) $(TARGET_BENCH)
+	rm -f test_faaq bench_faaq example tsan_test_faaq

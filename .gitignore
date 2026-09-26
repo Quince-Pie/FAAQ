@@ -1,0 +1,14 @@
+# build outputs
+/test_faaq
+/bench_faaq
+/bench_xenium
+/example
+/fuzz_faaq_*
+/tsan_*
+/asan_*
+*.o
+compile_commands.json
+.cache/
+# fuzzing campaign outputs
+/fuzz/out/
+/fuzz/corpus/

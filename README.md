@@ -107,6 +107,16 @@ The original FAAArrayQueue takes a thread id because its hazard pointers live in
 
 Reclaimed nodes are cached per thread (`FAAQ_NODE_CACHE_CAPACITY`, default 256) and freed at thread exit.
 
+## What is different from the original FAAArrayQueue
+
+Three things, each measured on its own (see the comparison below):
+
+  * **Cached protection.** A thread keeps its hazard pointers on the head and tail nodes it last used, so the protect-validate sequence (with its seq_cst fence) runs only when it moves to another node, not on every operation.
+  * **No hot-line read on the pop side.** The empty check compares `deqidx` with `enqidx`, and `enqidx` is the line every enqueuer hammers. It only grows, so a value read earlier on the same node is a lower bound: while `deqidx` is below it the queue is provably non-empty and the read is skipped.
+  * **Speculative claim** (`FAAQ_SPEC_CLAIM`, default 16). Under contention the pop's `deqidx` load and its fetch-add each miss on the same line, because other dequeuers steal it in between. When the last `enqidx` a thread saw lies more than the slack beyond its own last claimed index, producer-claimed items provably lie ahead and the dequeue claims with the fetch-add alone. An overshoot (other dequeuers consumed the slack) shows up as an empty slot, is poisoned immediately, and the next attempt takes the checked path; linearizability is unchanged because a claimed index is handled exactly as a claimed-but-not-yet-stored slot already was.
+
+Things that were tried and measured as useless or harmful on this code, so they are not in it: pacing the fetch-adds by observed contention, a per-operation fence, tighter or delayed polling of pending slots, consumer hold-off heuristics, backoff on empty pops, validating the cached node against the live head/tail pointer, alternative node alignments, and shorter reclamation scan intervals.
+
 ## Building and testing
 
 ```

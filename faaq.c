@@ -31,6 +31,18 @@
 #    define FAAQ_SPIN_ITEM 1200
 #endif
 
+// Speculative claim. A dequeue normally loads deqidx to check for emptiness and
+// then fetch-adds it; under contention each of the two touches misses on the
+// same line, because other dequeuers steal it in between. When the last enqidx
+// this thread saw lies more than this many indices beyond its own last claim,
+// producer-claimed items provably lie ahead and the dequeue claims with the
+// fetch-add alone. An overshoot (other dequeuers took all the slack) shows up
+// as an empty slot, is poisoned at once, and the next attempt takes the checked
+// path. 0 disables.
+#ifndef FAAQ_SPEC_CLAIM
+#    define FAAQ_SPEC_CLAIM 16
+#endif
+
 static_assert(FAAQ_TLS_SLOTS >= 1, "need at least one slot");
 
 // ----------------------------------------------------------------------------
@@ -86,6 +98,8 @@ typedef struct
     hazptr_holder_t tail_holder; // protects last_tail while it is non-null
     Node_t*         last_head;
     Node_t*         last_tail;
+    size_t          enq_seen; // lower bound of last_head->enqidx seen on this node
+    size_t          deq_last; // last index claimed on last_head (speculation)
 } faaq_slot_t;
 
 typedef struct
@@ -438,19 +452,35 @@ void* faa_queue_dequeue(FAAArrayQueue_t* q)
         if (lhead == nullptr) {
             HAZPTR_PROTECT(lhead, h, &q->head);
             s->last_head = lhead;
+            s->enq_seen  = 0;
+            s->deq_last  = 0;
         }
 
-        // Empty check. The next == nullptr part is essential: a cached (or
-        // freshly loaded) head that has been drained still has items behind it
-        // whenever a successor exists, and only the fetch-add path below moves
-        // past it.
-        size_t const deq = atomic_load_explicit(&lhead->deqidx, memory_order_seq_cst);
-        size_t const enq = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
-        if (deq >= enq && atomic_load_explicit(&lhead->next, memory_order_acquire) == nullptr) {
-            return nullptr;
+        bool speculative = false;
+#if FAAQ_SPEC_CLAIM > 0
+        speculative = s->enq_seen > s->deq_last + FAAQ_SPEC_CLAIM;
+#endif
+        if (!speculative) {
+            // Empty check. The next == nullptr part is essential: a cached (or
+            // freshly loaded) head that has been drained still has items behind it
+            // whenever a successor exists, and only the fetch-add path below moves
+            // past it.
+            size_t const deq = atomic_load_explicit(&lhead->deqidx, memory_order_seq_cst);
+            // enqidx only grows, so a value seen earlier on this node is a lower bound:
+            // while deqidx is below it the queue is provably non-empty and the
+            // enqueuers' hot line need not be read at all.
+            if (deq >= s->enq_seen) {
+                size_t const enq = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
+                s->enq_seen      = enq;
+                if (deq >= enq
+                    && atomic_load_explicit(&lhead->next, memory_order_acquire) == nullptr) {
+                    return nullptr;
+                }
+            }
         }
 
         size_t const idx = atomic_fetch_add_explicit(&lhead->deqidx, 1, memory_order_seq_cst);
+        s->deq_last      = idx;
 
         if (idx < FAA_BUFFER_SIZE) {
             size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
@@ -459,16 +489,32 @@ void* faa_queue_dequeue(FAAArrayQueue_t* q)
             // index is ours alone.
             void* item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
             if (item == nullptr) {
-                // The enqueuer claimed this index but has not stored yet.
-                for (int spin = 0; spin < FAAQ_SPIN_ITEM && item == nullptr; spin++) {
-                    backoff(spin);
-                    item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
+                bool overshoot = false;
+                if (speculative) {
+                    size_t const enq_now
+                        = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
+                    s->enq_seen = enq_now;
+                    if (idx >= enq_now) {
+                        // Nobody has claimed this index for an enqueue: poison it so a
+                        // later enqueue retries elsewhere, then take the checked path.
+                        overshoot = true;
+                        item      = atomic_exchange_explicit(
+                            &lhead->items[physical_idx], TAKEN, memory_order_acquire);
+                    }
                 }
-                if (item == nullptr) {
-                    // Poison the slot: either we get the item that just landed, or
-                    // the enqueuer's CAS fails and it retries with a new index.
-                    item = atomic_exchange_explicit(
-                        &lhead->items[physical_idx], TAKEN, memory_order_acquire);
+                if (!overshoot) {
+                    // The enqueuer claimed this index but has not stored yet.
+                    for (int spin = 0; spin < FAAQ_SPIN_ITEM && item == nullptr; spin++) {
+                        backoff(spin);
+                        item = atomic_load_explicit(&lhead->items[physical_idx],
+                                                    memory_order_acquire);
+                    }
+                    if (item == nullptr) {
+                        // Poison the slot: either we get the item that just landed, or
+                        // the enqueuer's CAS fails and it retries with a new index.
+                        item = atomic_exchange_explicit(
+                            &lhead->items[physical_idx], TAKEN, memory_order_acquire);
+                    }
                 }
             }
             if (item == nullptr || item == TAKEN) {

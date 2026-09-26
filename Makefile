@@ -30,6 +30,7 @@ HDRS     := faaq.h hp.h test_threads.h
 
 SAN      := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 FUZZ_CFG := -DFAA_BUFFER_SIZE_CFG=4 -DHP_LOCAL_SCAN_INTERVAL=8 -DFAAQ_SPIN_ITEM=0 -DFAAQ_SPIN_NEXT=0 \
+            -DFAAQ_SPEC_CLAIM=1 \
             -DFAAQ_TLS_SLOTS=2 -DFAAQ_NODE_CACHE_CAPACITY=0
 
 FUZZ_IN  ?= fuzz/seeds

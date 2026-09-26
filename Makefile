@@ -37,7 +37,7 @@ FUZZ_IN  ?= fuzz/seeds
 FUZZ_OUT ?= fuzz/out
 FUZZ_SEC ?= 600
 
-.PHONY: all test tsan bench example fuzz-smoke fuzz-afl fuzz-libfuzzer clean
+.PHONY: all test tsan bench compare-xenium example fuzz-smoke fuzz-afl fuzz-libfuzzer clean
 
 all: test_faaq bench_faaq example
 
@@ -66,6 +66,24 @@ bench_faaq: bench_faaq.c $(SRCS) $(HDRS)
 
 bench: bench_faaq
 	./bench_faaq -s 2 -t 1,2,4,8,16
+
+# The same driver for xenium's ramalhete_queue (C++), for like-for-like
+# comparisons: XENIUM_DIR must point at a checkout of github.com/mpoeter/xenium.
+XENIUM_DIR ?= ../xenium
+CXX        ?= g++
+
+bench_xenium: bench_xenium.cpp
+	$(CXX) -std=c++20 -O3 -flto -DNDEBUG -I$(XENIUM_DIR) bench_xenium.cpp -o $@ $(LDLIBS)
+
+# Interleaved, pinned comparison: ours and every xenium reclaimer, 5 reps, CSV.
+compare-xenium: bench_faaq bench_xenium
+	@echo "variant,workload,threads,rep,mops"; \
+	for r in 0 1 2 3 4; do \
+	  ./bench_faaq -s 2 -t 1,2,4,8,16 -w all -r 1 -p | tail -n +2 | sed "s/^\([a-z]*\),\([0-9]*\),0,/ours,\1,\2,$$r,/"; \
+	  for q in hp ebr nebr debra qsbr; do \
+	    ./bench_xenium -q $$q -s 2 -t 1,2,4,8,16 -w all -r 1 -p | tail -n +2 | sed "s/^\([a-z]*\),\([0-9]*\),0,/x-$$q,\1,\2,$$r,/"; \
+	  done; \
+	done
 
 example: example.c $(SRCS) $(HDRS)
 	$(CC) $(STD) $(WARN) -O2 example.c $(SRCS) -o $@ $(LDLIBS)
@@ -97,4 +115,4 @@ fuzz-libfuzzer: fuzz_faaq_libfuzzer
 	./fuzz_faaq_libfuzzer -max_len=2048 -timeout=20 -max_total_time=$(FUZZ_SEC) fuzz/corpus $(FUZZ_IN)
 
 clean:
-	rm -f test_faaq bench_faaq example tsan_test_faaq tsan_fuzz_faaq fuzz_faaq_smoke fuzz_faaq_afl fuzz_faaq_libfuzzer
+	rm -f test_faaq bench_faaq bench_xenium example tsan_test_faaq tsan_fuzz_faaq fuzz_faaq_smoke fuzz_faaq_afl fuzz_faaq_libfuzzer

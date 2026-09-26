@@ -61,8 +61,10 @@ tsan: tsan_test_faaq tsan_fuzz_faaq
 
 # --- performance -------------------------------------------------------------
 
+# -fomit-frame-pointer: the nixpkgs cc wrapper injects -fno-omit-frame-pointer
+# into every compile (cc-cflags-before); a flag on the command line wins.
 bench_faaq: bench_faaq.c $(SRCS) $(HDRS)
-	$(CC) $(STD) $(WARN) -O3 -flto -DNDEBUG bench_faaq.c $(SRCS) -o $@ $(LDLIBS)
+	$(CC) $(STD) $(WARN) -O3 -flto -DNDEBUG -fomit-frame-pointer bench_faaq.c $(SRCS) -o $@ $(LDLIBS)
 
 bench: bench_faaq
 	./bench_faaq -s 2 -t 1,2,4,8,16
@@ -73,7 +75,7 @@ XENIUM_DIR ?= ../xenium
 CXX        ?= g++
 
 bench_xenium: bench_xenium.cpp
-	$(CXX) -std=c++20 -O3 -flto -DNDEBUG -I$(XENIUM_DIR) bench_xenium.cpp -o $@ $(LDLIBS)
+	$(CXX) -std=c++20 -O3 -flto -DNDEBUG -fomit-frame-pointer -I$(XENIUM_DIR) bench_xenium.cpp -o $@ $(LDLIBS)
 
 # Interleaved, pinned comparison: ours and every xenium reclaimer, 5 reps, CSV.
 compare-xenium: bench_faaq bench_xenium
@@ -86,7 +88,7 @@ compare-xenium: bench_faaq bench_xenium
 	done
 
 example: example.c $(SRCS) $(HDRS)
-	$(CC) $(STD) $(WARN) -O2 example.c $(SRCS) -o $@ $(LDLIBS)
+	$(CC) $(STD) $(WARN) -O2 -fomit-frame-pointer example.c $(SRCS) -o $@ $(LDLIBS)
 
 # --- fuzzing ------------------------------------------------------------------
 

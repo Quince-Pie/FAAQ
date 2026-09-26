@@ -279,15 +279,27 @@ __attribute__((noinline, cold)) static void slot_lookup_slow(FAAArrayQueue_t con
     hazptr_holder_init(&s->tail_holder);
 }
 
-// Hot path: one thread-local compare. The state a tid used to select lives in
-// the thread instead of in the queue. Afterwards slots[0] is the attached
-// queue's entry, so callers address it as a constant thread-local (an
-// %fs-relative operand, no base register kept live across the loop).
-static inline void slot_attach(FAAArrayQueue_t const* q)
+// Hot path: one thread-local compare (slot_attached). The state a tid used to
+// select lives in the thread instead of in the queue. Afterwards slots[0] is
+// the attached queue's entry, so the operations address it as a constant
+// thread-local (an %fs-relative operand, no base register kept live). A miss
+// goes through a tail-calling helper so the hot paths contain no call and
+// therefore no stack adjustment at all.
+static inline bool slot_attached(FAAArrayQueue_t const* q)
 {
-    if (__builtin_expect(faaq_tls.slots[0].qid != q->id, 0)) {
-        slot_lookup_slow(q);
-    }
+    return __builtin_expect(faaq_tls.slots[0].qid == q->id, 1);
+}
+
+__attribute__((noinline, cold)) static void enqueue_miss(FAAArrayQueue_t* q, void* item)
+{
+    slot_lookup_slow(q);
+    faa_queue_enqueue(q, item);
+}
+
+__attribute__((noinline, cold)) static void* dequeue_miss(FAAArrayQueue_t* q)
+{
+    slot_lookup_slow(q);
+    return faa_queue_dequeue(q);
 }
 
 // ----------------------------------------------------------------------------
@@ -360,203 +372,256 @@ void faa_queue_destroy(FAAArrayQueue_t* q, void (*free_payload)(void*))
  * their single-location publication needs.
  */
 
+/*
+ * The slow paths of both operations are kept out of line and end by
+ * re-entering the operation (a tail call the compiler turns into a jump, so no
+ * stack grows). That is the retry loop of the original algorithm, but the hot
+ * paths carry no stack frame and no callee-saved register: from the codegen,
+ * seven of the twenty-four instructions of the old dequeue fast path were frame
+ * and register bookkeeping for the transition paths alone.
+ */
+
+__attribute__((noinline, cold)) static void enqueue_reattach(FAAArrayQueue_t* q, void* item)
+{
+    faaq_slot_t* const s = &faaq_tls.slots[0];
+    Node_t*            ltail;
+    HAZPTR_PROTECT(ltail, &s->tail_holder, &q->tail);
+    s->last_tail = ltail;
+    faa_queue_enqueue(q, item);
+}
+
+// The cached node is full: link a new node carrying the item, or follow the
+// successor another enqueuer linked, then retry.
+__attribute__((noinline)) static void
+enqueue_full(FAAArrayQueue_t* q, void* item, Node_t* ltail, size_t idx)
+{
+    faaq_slot_t* const     s = &faaq_tls.slots[0];
+    hazptr_holder_t* const h = &s->tail_holder;
+
+    Node_t* lnext = atomic_load_explicit(&ltail->next, memory_order_acquire);
+
+    if (lnext == nullptr && idx > FAA_BUFFER_SIZE) {
+        // Another enqueuer overflowed first and is linking a node: wait briefly
+        // rather than allocate a node that will lose the CAS.
+        for (int spin = 0; spin < FAAQ_SPIN_NEXT && lnext == nullptr; spin++) {
+            backoff_link(spin);
+            lnext = atomic_load_explicit(&ltail->next, memory_order_acquire);
+        }
+    }
+
+    if (lnext == nullptr) {
+        Node_t* new_node = node_new(item);
+        if (!new_node) {
+            perror("C23 FAAQueue Fatal Error: Failed to allocate Node_t");
+            abort();
+        }
+        Node_t* expected_next = nullptr;
+        if (atomic_compare_exchange_strong_explicit(&ltail->next,
+                                                    &expected_next,
+                                                    new_node,
+                                                    memory_order_release,
+                                                    memory_order_acquire)) {
+            Node_t* expected_tail = ltail;
+            atomic_compare_exchange_strong_explicit(
+                &q->tail, &expected_tail, new_node, memory_order_release, memory_order_relaxed);
+            s->last_tail = nullptr;
+            hazptr_reset(h, nullptr);
+            return;
+        }
+        node_reclaim(&new_node->hp_base); // never published
+        lnext = expected_next;
+    }
+
+    // Help advance the tail, but only if it still points here: a CAS that would
+    // fail still takes the line exclusive, and every overflowing enqueuer gets
+    // here at once.
+    if (atomic_load_explicit(&q->tail, memory_order_relaxed) == ltail) {
+        Node_t* expected_tail = ltail;
+        atomic_compare_exchange_strong_explicit(
+            &q->tail, &expected_tail, lnext, memory_order_release, memory_order_relaxed);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(lnext, 1, 3);
+#endif
+    s->last_tail = nullptr;
+    hazptr_reset(h, nullptr);
+    faa_queue_enqueue(q, item);
+}
+
 void faa_queue_enqueue(FAAArrayQueue_t* q, void* item)
 {
     if (item == nullptr || item == TAKEN) {
         return;
     }
 
-    slot_attach(q);
+    if (!slot_attached(q)) {
+        enqueue_miss(q, item);
+        return;
+    }
+    faaq_slot_t* const s     = &faaq_tls.slots[0];
+    Node_t* const      ltail = s->last_tail;
+    if (ltail == nullptr) {
+        enqueue_reattach(q, item);
+        return;
+    }
+
+    size_t const idx = atomic_fetch_add_explicit(&ltail->enqidx, 1, memory_order_seq_cst);
+    if (idx >= FAA_BUFFER_SIZE) {
+        enqueue_full(q, item, ltail, idx);
+        return;
+    }
+
+    size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
+    void*        expected     = nullptr;
+    if (atomic_compare_exchange_strong_explicit(&ltail->items[physical_idx],
+                                                &expected,
+                                                item,
+                                                memory_order_release,
+                                                memory_order_relaxed)) {
+        // ltail stays cached (and protected) for the next call.
+        return;
+    }
+    // A dequeuer gave up on this slot and poisoned it: claim a new index.
+    faa_queue_enqueue(q, item);
+}
+
+__attribute__((noinline, cold)) static void* dequeue_reattach(FAAArrayQueue_t* q)
+{
+    faaq_slot_t* const s = &faaq_tls.slots[0];
+    Node_t*            lhead;
+    HAZPTR_PROTECT(lhead, &s->head_holder, &q->head);
+    s->last_head = lhead;
+    s->enq_seen  = 0;
+    s->deq_last  = 0;
+    return faa_queue_dequeue(q);
+}
+
+// The cached node is drained: move to the successor and retry, or report empty.
+__attribute__((noinline)) static void* dequeue_drained(FAAArrayQueue_t* q, Node_t* lhead)
+{
     faaq_slot_t* const     s = &faaq_tls.slots[0];
-    hazptr_holder_t* const h = &s->tail_holder;
+    hazptr_holder_t* const h = &s->head_holder;
 
-    while (true) {
-        Node_t* ltail = s->last_tail;
-        if (ltail == nullptr) {
-            HAZPTR_PROTECT(ltail, h, &q->tail);
-            s->last_tail = ltail;
-        }
-
-        size_t const idx = atomic_fetch_add_explicit(&ltail->enqidx, 1, memory_order_seq_cst);
-
-        if (idx < FAA_BUFFER_SIZE) {
-            size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
-            void*        expected     = nullptr;
-            if (atomic_compare_exchange_strong_explicit(&ltail->items[physical_idx],
-                                                        &expected,
-                                                        item,
-                                                        memory_order_release,
-                                                        memory_order_relaxed)) {
-                // ltail stays cached (and protected) for the next call.
-                return;
+    Node_t* lnext = atomic_load_explicit(&lhead->next, memory_order_acquire);
+    if (lnext == nullptr) {
+        // Only an enqueuer that overflowed this node will link a successor.
+        for (int spin = 0; spin < FAAQ_SPIN_NEXT && lnext == nullptr; spin++) {
+            if (atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst) <= FAA_BUFFER_SIZE) {
+                break;
             }
-            // A dequeuer gave up on this slot and poisoned it: claim a new index.
-            continue;
+            backoff_link(spin);
+            lnext = atomic_load_explicit(&lhead->next, memory_order_acquire);
         }
-
-        // --- Node full ---
-        Node_t* lnext = atomic_load_explicit(&ltail->next, memory_order_acquire);
-
-        if (lnext == nullptr && idx > FAA_BUFFER_SIZE) {
-            // Another enqueuer overflowed first and is linking a node: wait briefly
-            // rather than allocate a node that will lose the CAS.
-            for (int spin = 0; spin < FAAQ_SPIN_NEXT && lnext == nullptr; spin++) {
-                backoff_link(spin);
-                lnext = atomic_load_explicit(&ltail->next, memory_order_acquire);
-            }
-        }
-
         if (lnext == nullptr) {
-            Node_t* new_node = node_new(item);
-            if (!new_node) {
-                perror("C23 FAAQueue Fatal Error: Failed to allocate Node_t");
-                abort();
-            }
-            Node_t* expected_next = nullptr;
-            if (atomic_compare_exchange_strong_explicit(&ltail->next,
-                                                        &expected_next,
-                                                        new_node,
-                                                        memory_order_release,
-                                                        memory_order_acquire)) {
-                Node_t* expected_tail = ltail;
-                atomic_compare_exchange_strong_explicit(
-                    &q->tail, &expected_tail, new_node, memory_order_release, memory_order_relaxed);
-                s->last_tail = nullptr;
-                hazptr_reset(h, nullptr);
-                return;
-            }
-            node_reclaim(&new_node->hp_base); // never published
-            lnext = expected_next;
+            // lhead is the last node: the queue is empty. Keep it cached.
+            return nullptr;
         }
+    }
 
-        // Help advance the tail, then re-read it on the next iteration.
-        Node_t* expected_tail = ltail;
+    // Keep tail >= head, then try to advance head. Each CAS runs only if the
+    // pointer still needs it: a CAS that would fail still takes the line
+    // exclusive, and every dequeuer that drained this node gets here at once.
+    if (atomic_load_explicit(&q->tail, memory_order_relaxed) == lhead) {
+        Node_t* expected_tail = lhead;
         atomic_compare_exchange_strong_explicit(
             &q->tail, &expected_tail, lnext, memory_order_release, memory_order_relaxed);
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(lnext, 1, 3);
-#endif
-        s->last_tail = nullptr;
-        hazptr_reset(h, nullptr);
     }
+    bool advanced = false;
+    if (atomic_load_explicit(&q->head, memory_order_relaxed) == lhead) {
+        Node_t* expected_head = lhead;
+        advanced              = atomic_compare_exchange_strong_explicit(
+            &q->head, &expected_head, lnext, memory_order_release, memory_order_relaxed);
+    }
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(lnext, 0, 3);
+#endif
+    s->last_head = nullptr;
+    hazptr_reset(h, nullptr);
+    if (advanced) {
+        // We unlinked it; nobody can reach it through the queue any more.
+        hazptr_retire(&lhead->hp_base, node_reclaim);
+    }
+    return faa_queue_dequeue(q);
+}
+
+// The index is ours but its slot is still empty: the enqueuer that claimed it
+// has not stored yet, or, after a speculative claim, nobody has claimed it.
+__attribute__((noinline)) static void*
+dequeue_wait(FAAArrayQueue_t* q, Node_t* lhead, size_t idx, size_t physical_idx, bool speculative)
+{
+    faaq_slot_t* const s    = &faaq_tls.slots[0];
+    void*              item = nullptr;
+
+    if (speculative) {
+        size_t const enq_now = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
+        s->enq_seen          = enq_now;
+        if (idx >= enq_now) {
+            // Nobody has claimed this index for an enqueue: poison it so a later
+            // enqueue retries elsewhere, then take the checked path.
+            item = atomic_exchange_explicit(
+                &lhead->items[physical_idx], TAKEN, memory_order_acquire);
+            return item != nullptr ? item : faa_queue_dequeue(q);
+        }
+    }
+
+    for (int spin = 0; spin < FAAQ_SPIN_ITEM && item == nullptr; spin++) {
+        backoff(spin);
+        item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
+    }
+    if (item == nullptr) {
+        // Poison the slot: either we get the item that just landed, or the
+        // enqueuer's CAS fails and it retries with a new index. An exchange
+        // returns the old value, so it is never TAKEN.
+        item = atomic_exchange_explicit(&lhead->items[physical_idx], TAKEN, memory_order_acquire);
+    }
+    return item != nullptr ? item : faa_queue_dequeue(q);
 }
 
 void* faa_queue_dequeue(FAAArrayQueue_t* q)
 {
-    slot_attach(q);
-    faaq_slot_t* const     s = &faaq_tls.slots[0];
-    hazptr_holder_t* const h = &s->head_holder;
+    if (!slot_attached(q)) {
+        return dequeue_miss(q);
+    }
+    faaq_slot_t* const s     = &faaq_tls.slots[0];
+    Node_t* const      lhead = s->last_head;
+    if (lhead == nullptr) {
+        return dequeue_reattach(q);
+    }
 
-    while (true) {
-        Node_t* lhead = s->last_head;
-        if (lhead == nullptr) {
-            HAZPTR_PROTECT(lhead, h, &q->head);
-            s->last_head = lhead;
-            s->enq_seen  = 0;
-            s->deq_last  = 0;
-        }
-
-        bool speculative = false;
+    bool speculative = false;
 #if FAAQ_SPEC_CLAIM > 0
-        speculative = s->enq_seen > s->deq_last + FAAQ_SPEC_CLAIM;
+    speculative = s->enq_seen > s->deq_last + FAAQ_SPEC_CLAIM;
 #endif
-        if (!speculative) {
-            // Empty check. The next == nullptr part is essential: a cached (or
-            // freshly loaded) head that has been drained still has items behind it
-            // whenever a successor exists, and only the fetch-add path below moves
-            // past it.
-            size_t const deq = atomic_load_explicit(&lhead->deqidx, memory_order_seq_cst);
-            // enqidx only grows, so a value seen earlier on this node is a lower bound:
-            // while deqidx is below it the queue is provably non-empty and the
-            // enqueuers' hot line need not be read at all.
-            if (deq >= s->enq_seen) {
-                size_t const enq = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
-                s->enq_seen      = enq;
-                if (deq >= enq
-                    && atomic_load_explicit(&lhead->next, memory_order_acquire) == nullptr) {
-                    return nullptr;
-                }
-            }
-        }
-
-        size_t const idx = atomic_fetch_add_explicit(&lhead->deqidx, 1, memory_order_seq_cst);
-        s->deq_last      = idx;
-
-        if (idx < FAA_BUFFER_SIZE) {
-            size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
-
-            // Fast path: the item is usually already there; no RMW needed, the
-            // index is ours alone.
-            void* item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
-            if (item == nullptr) {
-                bool overshoot = false;
-                if (speculative) {
-                    size_t const enq_now
-                        = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
-                    s->enq_seen = enq_now;
-                    if (idx >= enq_now) {
-                        // Nobody has claimed this index for an enqueue: poison it so a
-                        // later enqueue retries elsewhere, then take the checked path.
-                        overshoot = true;
-                        item      = atomic_exchange_explicit(
-                            &lhead->items[physical_idx], TAKEN, memory_order_acquire);
-                    }
-                }
-                if (!overshoot) {
-                    // The enqueuer claimed this index but has not stored yet.
-                    for (int spin = 0; spin < FAAQ_SPIN_ITEM && item == nullptr; spin++) {
-                        backoff(spin);
-                        item = atomic_load_explicit(&lhead->items[physical_idx],
-                                                    memory_order_acquire);
-                    }
-                    if (item == nullptr) {
-                        // Poison the slot: either we get the item that just landed, or
-                        // the enqueuer's CAS fails and it retries with a new index.
-                        item = atomic_exchange_explicit(
-                            &lhead->items[physical_idx], TAKEN, memory_order_acquire);
-                    }
-                }
-            }
-            if (item == nullptr || item == TAKEN) {
-                continue;
-            }
-            // lhead stays cached (and protected) for the next call.
-            return item;
-        }
-
-        // --- Node drained ---
-        Node_t* lnext = atomic_load_explicit(&lhead->next, memory_order_acquire);
-        if (lnext == nullptr) {
-            // Only an enqueuer that overflowed this node will link a successor.
-            for (int spin = 0; spin < FAAQ_SPIN_NEXT && lnext == nullptr; spin++) {
-                if (atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst) <= FAA_BUFFER_SIZE) {
-                    break;
-                }
-                backoff_link(spin);
-                lnext = atomic_load_explicit(&lhead->next, memory_order_acquire);
-            }
-            if (lnext == nullptr) {
-                // lhead is the last node: the queue is empty. Keep it cached.
+    if (!speculative) {
+        // Empty check. The next == nullptr part is essential: a cached (or
+        // freshly loaded) head that has been drained still has items behind it
+        // whenever a successor exists, and only the fetch-add path below moves
+        // past it.
+        size_t const deq = atomic_load_explicit(&lhead->deqidx, memory_order_seq_cst);
+        // enqidx only grows, so a value seen earlier on this node is a lower bound:
+        // while deqidx is below it the queue is provably non-empty and the
+        // enqueuers' hot line need not be read at all.
+        if (deq >= s->enq_seen) {
+            size_t const enq = atomic_load_explicit(&lhead->enqidx, memory_order_seq_cst);
+            s->enq_seen      = enq;
+            if (deq >= enq && atomic_load_explicit(&lhead->next, memory_order_acquire) == nullptr) {
                 return nullptr;
             }
         }
-
-        // Keep tail >= head, then try to advance head.
-        Node_t* expected_tail = lhead;
-        atomic_compare_exchange_strong_explicit(
-            &q->tail, &expected_tail, lnext, memory_order_release, memory_order_relaxed);
-
-        Node_t*    expected_head = lhead;
-        bool const advanced      = atomic_compare_exchange_strong_explicit(
-            &q->head, &expected_head, lnext, memory_order_release, memory_order_relaxed);
-#if defined(__GNUC__) || defined(__clang__)
-        __builtin_prefetch(lnext, 0, 3);
-#endif
-        s->last_head = nullptr;
-        hazptr_reset(h, nullptr);
-        if (advanced) {
-            // We unlinked it; nobody can reach it through the queue any more.
-            hazptr_retire(&lhead->hp_base, node_reclaim);
-        }
     }
+
+    size_t const idx = atomic_fetch_add_explicit(&lhead->deqidx, 1, memory_order_seq_cst);
+    s->deq_last      = idx;
+    if (idx >= FAA_BUFFER_SIZE) {
+        return dequeue_drained(q, lhead);
+    }
+
+    size_t const physical_idx = (idx * FAA_STRIDE) & (FAA_BUFFER_SIZE - 1);
+    // Fast path: the item is usually already there; no RMW needed, the index is
+    // ours alone. lhead stays cached (and protected) for the next call.
+    void* const item = atomic_load_explicit(&lhead->items[physical_idx], memory_order_acquire);
+    if (item == nullptr) {
+        return dequeue_wait(q, lhead, idx, physical_idx, speculative);
+    }
+    return item;
 }

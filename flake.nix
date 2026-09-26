@@ -127,7 +127,11 @@
               # -fstack-protector-strong and -fzero-call-used-regs into both.
               # Off, so the compiler does exactly what the command line says and
               # measurements mean something; release builds re-enable hardening in
-              # their own derivation.
+              # their own derivation. One injection survives hardeningDisable: the
+              # cc wrapper appends -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer
+              # to every x86-64 compile (cc-cflags-before, no knob), so a build that
+              # wants the register back must pass -fomit-frame-pointer itself; a
+              # command-line flag wins.
               hardeningDisable = [ "all" ];
 
               env = {

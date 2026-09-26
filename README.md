@@ -115,6 +115,8 @@ Three things, each measured on its own (see the comparison below):
   * **No hot-line read on the pop side.** The empty check compares `deqidx` with `enqidx`, and `enqidx` is the line every enqueuer hammers. It only grows, so a value read earlier on the same node is a lower bound: while `deqidx` is below it the queue is provably non-empty and the read is skipped.
   * **Speculative claim** (`FAAQ_SPEC_CLAIM`, default 16). Under contention the pop's `deqidx` load and its fetch-add each miss on the same line, because other dequeuers steal it in between. When the last `enqidx` a thread saw lies more than the slack beyond its own last claimed index, producer-claimed items provably lie ahead and the dequeue claims with the fetch-add alone. An overshoot (other dequeuers consumed the slack) shows up as an empty slot, is poisoned immediately, and the next attempt takes the checked path; linearizability is unchanged because a claimed index is handled exactly as a claimed-but-not-yet-stored slot already was.
 
+The hot paths of both operations are call-free: every slow path (slot miss, re-protecting the cached node, node full, node drained, waiting for a pending slot) lives in an out-of-line helper that finishes by re-entering the operation, which the compiler turns into a tail jump. The fast dequeue is 20 instructions with no stack frame and no saved register; the fast enqueue inlines into its caller as 11 instructions from the queue-id compare to the CAS.
+
 Things that were tried and measured as useless or harmful on this code, so they are not in it: pacing the fetch-adds by observed contention, a per-operation fence, tighter or delayed polling of pending slots, consumer hold-off heuristics, backoff on empty pops, validating the cached node against the live head/tail pointer, alternative node alignments, and shorter reclamation scan intervals.
 
 ## Building and testing
@@ -122,9 +124,11 @@ Things that were tried and measured as useless or harmful on this code, so they 
 ```
 make test          # ASan + UBSan build of test_faaq.c, then run
 make tsan          # ThreadSanitizer build of the suite and of the fuzz harness, then run
-make bench         # -O3 -flto benchmark driver: ./bench_faaq [-s sec] [-t 1,2,4] [-w sym|pc|both] [-r reps] [-p]
+make bench         # -O3 -flto benchmark driver: ./bench_faaq [-s sec] [-t 1,2,4] [-w sym|pc|mix|both|all] [-r reps] [-p] [-i inflight]
 make example
 ```
+
+The optimized targets pass `-fomit-frame-pointer` explicitly: the nixpkgs cc wrapper appends `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer` to every x86-64 compile (it is not part of the hardening that the flake disables, and there is no knob), and a flag on the command line wins. Sanitizer builds keep frame pointers for their stack traces.
 
 `test_faaq.c` covers teardown/leaks, a deterministic regression for a thread whose cached head node was drained and unlinked by other threads, many queues per thread (slot eviction), 300 short-lived threads (hazard pointer record recycling), exact-once MPMC delivery at 4+4 and 16+16 threads, and a scaling benchmark. Under ThreadSanitizer the suite shrinks the concurrent phases (1/20 scale, and 8+8 threads at 1/100 for the oversubscribed one: TSan serializes every atomic through per-address locks, and 32 polling threads turn that into a convoy) and routes thread creation through pthreads (`test_threads.h`), because glibc's `thrd_create` calls its pthread internals directly and bypasses TSan's interceptors.
 
@@ -151,26 +155,26 @@ make bench_xenium XENIUM_DIR=/path/to/xenium
 make compare-xenium XENIUM_DIR=/path/to/xenium > compare.csv
 ```
 
-Results on a Ryzen 9 9950X3D (one thread per physical core, pinned, 2 s runs, medians of 5 interleaved repetitions, spread within ±1 percent unless noted), in M ops/s. `x-hp` is xenium with hazard pointers, `x-qsbr` with quiescent-state-based reclamation; the other three xenium reclaimers (EBR, NEBR, DEBRA) score between those two or below.
+Results on a Ryzen 9 9950X3D (one thread per physical core, pinned, 2 s runs, medians of 5 interleaved repetitions, spread within ±1 percent unless noted, both sides built with `-O3 -flto -fomit-frame-pointer`), in M ops/s. `x-hp` is xenium with hazard pointers, `x-qsbr` with quiescent-state-based reclamation; the other three xenium reclaimers (EBR, NEBR, DEBRA) score between those two or below.
 
 | workload | threads | ours | x-hp | x-qsbr | ours / best xenium |
 |---|---|---|---|---|---|
-| sym | 1 | 165.4 | 58.1 | 108.3 | 1.48x (NEBR 111.5) |
-| sym | 2 | 65.6 | 47.6 | 50.9 | 1.29x |
-| sym | 4 | 71.5 | 60.8 | 49.0 | 1.18x |
-| sym | 8 | 70.6 | 66.2 | 47.8 | 1.07x |
-| sym | 16 | 42.8 | 40.4 | 30.4 | 1.06x |
-| mix | 1 | 152.5 | 61.5 | 104.1 | 1.45x (NEBR 105.3) |
-| mix | 2 | 83.0 | 62.6 | 60.6 | 1.33x |
-| mix | 4 | 86.3 | 89.6 | 60.4 | 0.96x |
-| mix | 8 | 84.8 | 109.8 | 60.8 | 0.77x |
-| mix | 16 | 59.8 | 78.3 | 42.2 | 0.76x |
-| pc | 2 | 42.4 | 31.7 | 37.3 | 1.11x (NEBR 38.2) |
-| pc | 4 | 40.4 | 54.2 | 34.4 | 0.75x |
-| pc | 8 | 63.0 | 60.9 | 37.5 | 1.03x |
-| pc | 16 | 24.1 | 31.5 | 25.4 | 0.76x |
+| sym | 1 | 174.9 | 59.7 | 108.2 | 1.57x (NEBR 111.2) |
+| sym | 2 | 71.4 | 47.8 | 51.2 | 1.40x |
+| sym | 4 | 73.8 | 61.0 | 48.2 | 1.21x |
+| sym | 8 | 73.3 | 66.2 | 47.4 | 1.11x |
+| sym | 16 | 43.9 | 40.4 | 30.1 | 1.09x |
+| mix | 1 | 162.6 | 63.6 | 103.6 | 1.54x (NEBR 105.4) |
+| mix | 2 | 85.4 | 63.6 | 60.6 | 1.34x |
+| mix | 4 | 90.6 | 90.1 | 58.6 | 1.01x |
+| mix | 8 | 88.7 | 109.5 | 60.0 | 0.81x |
+| mix | 16 | 60.6 | 77.9 | 42.1 | 0.78x |
+| pc | 2 | 42.3 | 31.2 | 35.7 | 1.18x (NEBR 35.8) |
+| pc | 4 | 43.3 | 55.9 | 34.8 | 0.77x |
+| pc | 8 | 42.1 | 62.2 | 36.5 | 0.68x |
+| pc | 16 | 25.0 | 29.1 | 25.2 | 0.86x |
 
-Reading: against xenium's fence-free reclaimers (QSBR, NEBR, EBR, DEBRA), which pay the same per-operation cost we do, this queue is 1.3x to 2.9x faster at every point. xenium's hazard-pointer variant is the slowest of the five single-threaded (a seq_cst fence per operation) but the fastest under contention, and it holds three regions: the random mix at 8 and 16 threads, and the throttled producer/consumer split at 4 and 16 threads. The latter is a regime artifact of that workload: sampling the queue occupancy shows xenium-HP sitting at the 8192-item cap (its slower pop keeps the queue full, so producers idle on the driver's throttle and pops never wait) while every other variant, ours included, sits near empty. The mix gap is real. Hardware counters at 8 threads show the same cycle budget, xenium-HP retiring 117 instructions per operation at IPC 0.29 against our 54 at IPC 0.08, i.e. we stall more per access on the contended lines; giving our queue the same per-operation fence, or any of the other mechanisms listed above, makes ours slower, so the cause is not the fence itself and was not isolated.
+Reading: against xenium's fence-free reclaimers (QSBR, NEBR, EBR, DEBRA), which pay the same per-operation cost we do, this queue is 1.1x to 1.6x faster than the best of them at every point but the throttled split at 16 threads, where they and ours are within 4 percent of each other, and up to 2.2x faster than the slowest of them. xenium's hazard-pointer variant is the slowest of the five single-threaded (a seq_cst fence per operation) but the fastest under contention, and it holds three regions: the random mix at 8 and 16 threads, and the throttled producer/consumer split at 4, 8 and 16 threads. The latter is a regime artifact of that workload: sampling the queue occupancy shows xenium-HP sitting at the 8192-item cap (its slower pop keeps the queue full, so producers idle on the driver's throttle and pops never wait) while every other variant, ours included, sits near empty. The mix gap is real. Hardware counters at 8 threads show the same cycle budget, xenium-HP retiring 111 instructions per operation at IPC 0.28 against our 46 at IPC 0.09, i.e. we stall more per access on the contended lines; giving our queue the same per-operation fence, or any of the other mechanisms listed above, makes ours slower, so the cause is not the fence itself and was not isolated.
 
 ## References
 

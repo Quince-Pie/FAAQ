@@ -118,6 +118,20 @@ make example
 
 `test_faaq.c` covers teardown/leaks, a deterministic regression for a thread whose cached head node was drained and unlinked by other threads, many queues per thread (slot eviction), 300 short-lived threads (hazard pointer record recycling), exact-once MPMC delivery at 4+4 and 16+16 threads, and a scaling benchmark. Under ThreadSanitizer the suite shrinks the concurrent phases (1/20 scale, and 8+8 threads at 1/100 for the oversubscribed one: TSan serializes every atomic through per-address locks, and 32 polling threads turn that into a convoy) and routes thread creation through pthreads (`test_threads.h`), because glibc's `thrd_create` calls its pthread internals directly and bypasses TSan's interceptors.
 
+## Fuzzing
+
+`fuzz_faaq.c` is a model-based harness in the libFuzzer convention (`LLVMFuzzerTestOneInput`). The input bytes are a small program over six live queues: enqueue, dequeue, bulk enqueue/dequeue, destroy+recreate, explicit hazard pointer cleanup, drain, and BURST, which runs a real multi-threaded phase (1-4 producers, 1-4 consumers) and checks exact-once delivery, per-producer FIFO order, emptiness afterwards, and (with one consumer) that a dequeue never reports "empty" once all producers have finished. Every single-threaded dequeue is checked against a reference FIFO and every destroy must drain exactly the model's contents in order.
+
+The fuzz builds shrink the tunables (`FUZZ_CFG` in the Makefile: 4-slot nodes, hazard pointer scans every 8 retirements, no spin-waits, 2 thread-local slots, no node cache) so node boundaries, reclamation, slot poisoning, per-thread slot eviction and real `free()`s all happen every few operations.
+
+```
+make fuzz-smoke                 # gcc + ASan/UBSan, PRNG-driven, no fuzzing engine needed
+make fuzz-afl FUZZ_SEC=600      # AFL++ (afl-clang-lto, ASan+UBSan), campaign into fuzz/out
+make fuzz-libfuzzer FUZZ_SEC=300 # libFuzzer, in the flake's clang shell (nix develop .#clang)
+```
+
+The flake's dev shells provide AFL++ (`aflplusplus`, the actively developed general-purpose fuzzer for C; libFuzzer has been maintenance-only since 2022). `afl-clang-lto` gives collision-free LTO edge coverage and CmpLog; the same harness runs unchanged under libFuzzer. For more cores, add secondary instances: `afl-fuzz -S s1 -i fuzz/seeds -o fuzz/out -- ./fuzz_faaq_afl`. Do not set `AFL_CC` in the environment: afl-cc reads it as the name of its backend compiler.
+
 ## References
 
 This work is directly inspired by:
